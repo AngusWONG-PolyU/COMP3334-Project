@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import sqlite3
 import hashlib
 import os
@@ -167,6 +167,17 @@ def save_file_to_db(user_id, filename, data):
     finally:
         conn.close()
 
+def get_file_from_db(user_id, filename):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT data FROM files WHERE user_id = ? AND filename = ?', (user_id, filename))
+    file = cur.fetchone()
+    conn.close()
+    
+    if file:
+        return file['data']
+    return None
+
 @app.route('/upload', methods=['POST'])
 def upload_file():
     # Check if a file part is present in the request
@@ -196,6 +207,41 @@ def upload_file():
         return response
     
     return jsonify({'message': 'File uploaded successfully'}), 201
+
+temp_files = set() # Set to track temporary files
+
+@app.after_request
+def remove_temp_files(response):
+    for file in temp_files:
+        if os.path.exists(file):
+            os.remove(file)
+    temp_files.clear()
+    return response
+
+@app.route('/download', methods=['GET'])
+def download_file():
+    username = request.args.get('username') # Get the username from the query parameters
+    filename = request.args.get('filename') # Get the filename from the query parameters
+
+    user_id = get_user_id_by_username(username) # Get the user_id based on the username
+    if user_id is None:
+        return jsonify({'error': 'User not found'}), 404  # Return error if user is not found
+    
+    if filename is None:
+        return jsonify({'error': 'Filename is required'}), 400 # Return error if filename is not provided
+    
+    file_data = get_file_from_db(user_id, filename)  # Get the file data from the database
+    if file_data is None:
+        return jsonify({'error': 'File not found'}), 404 # Return error if file is not found
+    
+    temp_file_path = f'temp_{filename}' # Create a temporary file path
+    with open(temp_file_path, 'wb') as f:
+        f.write(file_data)  # Write the file data to a temporary file
+    
+    temp_files.add(temp_file_path)  # Add the temp file to the tracking set
+    
+    return send_file(temp_file_path, as_attachment=True)  # Send the file as an attachment
+    
 
 
 if __name__ == '__main__':

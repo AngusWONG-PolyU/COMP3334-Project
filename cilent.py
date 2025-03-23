@@ -17,6 +17,7 @@ def print_menu():
     print("3. Reset Password")
     print("4. Quit")
     print("5. (DEBUGGING for upload file)")
+    print("6. (DEBUGGING for download file)")
 
 
 def register():
@@ -143,14 +144,29 @@ def uploadFileToServer(filePath, username):
         if os.path.exists(filePath):  # Ensure the encrypted file is deleted
             os.remove(filePath)
 
-def downloadFileFromServer():
-    # NOT FINISH
-    return
+def downloadFileFromServer(username, filename):
+    try:
+        response = requests.get(f"{SERVER_URL}/download", params={'username': username, 'filename': filename})  # Send a GET request to the server
+        response.raise_for_status()  # Check for HTTP errors
+        encryptedFilePath = filename  # Create a temporary file path
+        decryptedFilePath = encryptedFilePath[:-4]  # Remove the '.enc' extension from the filename
+        with open(encryptedFilePath, 'wb') as f:
+            f.write(response.content)  # Write the file content to a temporary file
+        decryptFile(encryptedFilePath, decryptedFilePath)  # Decrypt the file after downloading
+        os.remove(encryptedFilePath)  # Remove the temporary file
+        return {'message': 'File downloaded successfully'}
+    except Exception as e:
+        return {'error': str(e)}
 
 # DEBUG
 def uploadFile():
     filePath = input("Enter file path: ").strip()
     response = uploadFileToServer(filePath, loggedInUsername)
+    print(f'Server response: {response}')  # Print the server response
+
+def downloadFile():
+    filename = input("Enter filename: ").strip()
+    response = downloadFileFromServer(loggedInUsername, filename + '.enc')
     print(f'Server response: {response}')  # Print the server response
 # DEBUG
 
@@ -170,6 +186,8 @@ def main():
         # DEBUG
         elif choice == '5':
             uploadFile()
+        elif choice == '6':
+            downloadFile()
         #DEBUG
         else:
             print("Invalid choice. Please try again.")
