@@ -12,10 +12,22 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row  # Enable accessing columns by name.
     return conn
 
+def get_user_id_by_username(username):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT id FROM users WHERE username = ?', (username,))
+    user = cur.fetchone()
+    conn.close()
+    
+    if user:
+        return user['id']
+    return None
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # Create the user table
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,6 +35,23 @@ def init_db():
             password TEXT NOT NULL
         );
     ''')
+
+    # Create the files table
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            data BLOB NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+        );
+    ''')
+
+    # DEBUG
+    cur.execute('INSERT INTO users (username, password) VALUES (?, ?)',
+                    ('default_username', b'default_password'))
+    # DEBUG
+
     conn.commit()
     conn.close()
 
@@ -131,6 +160,42 @@ def reset_password():
     conn.close()
 
     return jsonify({'message': 'Password reset successfully'})
+
+def save_file_to_db(user_id, filename, data):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('INSERT INTO files (user_id, filename, data) VALUES (?, ?, ?)', (user_id, filename, data))
+    conn.commit()
+    conn.close()
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    # Check if a file part is present in the request
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    
+    # Check if a filename is provided
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    
+    data = request.get_json()
+    username = data.get('username')  # Get the username from the JSON data
+    
+    if username is None:
+        return jsonify({'error': 'Username is required'}), 400  # Check if username is provided
+
+    user_id = get_user_id_by_username(username) # Get the user_id based on the username
+    
+    if user_id is None:
+        return jsonify({'error': 'User not found'}), 404  # Return error if user is not found
+    
+    file_data = file.read()  # Read the file data
+    
+    save_file_to_db(user_id, file.filename, file_data) # Save the file to the database
+    
+    return jsonify({'message': 'File uploaded and saved to database successfully'}), 200
 
 
 if __name__ == '__main__':
