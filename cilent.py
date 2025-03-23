@@ -7,10 +7,8 @@ from cryptography.hazmat.backends import default_backend
 
 SERVER_URL = 'http://127.0.0.1:5000'
 
-# DEBUG
-username = 'default_username' # User name (default)
-password = b'default_password' # User password (default)
-# DEBUG
+loggedInUsername = None
+loggedInPassword = None
 
 def print_menu():
     print("\n=== Online Storage Application Client ===")
@@ -38,6 +36,8 @@ def register():
 
 
 def login():
+    global loggedInUsername # Use the global variable to store the logged-in username
+    global loggedInPassword # Use the global variable to store the logged-in password
     print("\n--- Login ---")
     username = input("Enter username: ").strip()
     password = input("Enter password: ").strip()
@@ -46,6 +46,8 @@ def login():
         response = requests.post(f"{SERVER_URL}/login", json=data)
         if response.status_code == 200:
             print("Success:", response.json().get("message"))
+            loggedInUsername = username # Store the logged-in username
+            loggedInPassword = password # Store the logged-in password
         else:
             print("Error:", response.json().get("error", "Login failed."))
     except Exception as e:
@@ -73,8 +75,8 @@ def encryptFunction(data):
     salt = os.urandom(16) # Generate the 16 bytes (128 bits) random data as the salt
 
     # Use PBKDF2HMAC to generate the secret key
-    kdf = PBKDF2HMAC(algorithms=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
-    AES_k = kdf.derive(password)
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
+    AES_k = kdf.derive(loggedInPassword.encode()) # Use the logged-in password as the password for PBKDF2HMAC
 
     AES_iv = os.urandom(16) # Generate the 16 bytes (128 bits) random data as the initialization vector of AES
 
@@ -96,8 +98,8 @@ def decryptFunction(encryptedData):
     ciphertext = encryptedData[32:] # Get the remaining of encryptedData as the ciphertext
 
     # Use PBKDF2HMAC to generate the secret key
-    kdf = PBKDF2HMAC(algorithms=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
-    AES_k = kdf.derive(password)
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
+    AES_k = kdf.derive(loggedInPassword.encode()) # Use the logged-in password as the password for PBKDF2HMAC
 
     cipher = Cipher(algorithms.AES(AES_k), modes.CBC(AES_iv))
     decryptor = cipher.decryptor()
@@ -124,12 +126,22 @@ def decryptFile(inputFile, outputFile):
         f.write(decryptedData) # Write the decrypted data to the output file
 
 def uploadFileToServer(filePath, username):
-    with open(filePath, 'rb') as f: # Open the file in binary read mode
-        files = {'file': f}
-        data = {'username': username}
-        response = requests.post(f"{SERVER_URL}/upload", files=files, data=data)
-    
-    return response
+    encryptFile(filePath, filePath + '.enc')  # Encrypt the file before uploading
+    filePath += '.enc'  # Change the file path to the encrypted file path
+    try:
+        with open(filePath, 'rb') as f:  # Open the file in binary read mode
+            files = {'file': f}
+            data = {'username': username}
+            
+            response = requests.post(f"{SERVER_URL}/upload", files=files, data=data)  # Send a POST request to the server
+        
+        response.raise_for_status()  # Check for HTTP errors
+        return response.json()  # Return JSON response
+    except Exception as e:
+        return {'error': str(e)}
+    finally:
+        if os.path.exists(filePath):  # Ensure the encrypted file is deleted
+            os.remove(filePath)
 
 def downloadFileFromServer():
     # NOT FINISH
@@ -138,8 +150,8 @@ def downloadFileFromServer():
 # DEBUG
 def uploadFile():
     filePath = input("Enter file path: ").strip()
-    response = uploadFileToServer(filePath, username)
-    print(f'Server response: {response.status_code} - {response.json()}')
+    response = uploadFileToServer(filePath, loggedInUsername)
+    print(f'Server response: {response}')  # Print the server response
 # DEBUG
 
 def main():

@@ -47,11 +47,6 @@ def init_db():
         );
     ''')
 
-    # DEBUG
-    cur.execute('INSERT INTO users (username, password) VALUES (?, ?)',
-                    ('default_username', b'default_password'))
-    # DEBUG
-
     conn.commit()
     conn.close()
 
@@ -162,11 +157,15 @@ def reset_password():
     return jsonify({'message': 'Password reset successfully'})
 
 def save_file_to_db(user_id, filename, data):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('INSERT INTO files (user_id, filename, data) VALUES (?, ?, ?)', (user_id, filename, data))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO files (user_id, filename, data) VALUES (?, ?, ?)', (user_id, filename, data))
+        conn.commit()
+    except sqlite3.Error as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -180,8 +179,7 @@ def upload_file():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-    data = request.get_json()
-    username = data.get('username')  # Get the username from the JSON data
+    username = request.form.get('username')  # Get the username from form data
     
     if username is None:
         return jsonify({'error': 'Username is required'}), 400  # Check if username is provided
@@ -193,9 +191,11 @@ def upload_file():
     
     file_data = file.read()  # Read the file data
     
-    save_file_to_db(user_id, file.filename, file_data) # Save the file to the database
+    response = save_file_to_db(user_id, file.filename, file_data)
+    if response is not None: # If an error occurred while saving the file to the database
+        return response
     
-    return jsonify({'message': 'File uploaded and saved to database successfully'}), 200
+    return jsonify({'message': 'File uploaded successfully'}), 201
 
 
 if __name__ == '__main__':
