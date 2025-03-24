@@ -4,7 +4,7 @@ import hashlib
 import os
 
 app = Flask(__name__)
-DATABASE = 'users.db'
+DATABASE = 'database.db'
 
 
 def get_db_connection():
