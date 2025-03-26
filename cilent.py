@@ -1,275 +1,620 @@
-import requests
 import os
-import getpass
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.backends import default_backend
+import base64
+import requests
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 SERVER_URL = 'http://127.0.0.1:5000'
+# Global variables to cache the RSA key encryption password and username during the session.
+KEY_PASSWORD = None
+SESSION_USERNAME = None
 
-loggedInUsername = None
-loggedInPassword = None
-# Maximum login attempts allowed before temporary lockout
-MAX_LOGIN_ATTEMPTS = 3
-# Dictionary to store login attempts by username
-login_attempts = {}
 
-def print_menu():
-    if loggedInUsername:
-        print("\n=== Online Storage Application Client ===")
-        print(f"[Logged in as: {loggedInUsername}]")
-        print("1. Reset Password")
-        print("2. Upload File")
-        print("3. Download File")
-        print("4. Logout")
-        print("5. Quit")
+def generate_rsa_keys(username, key_password):
+    """
+    Generate an RSA key pair for the given username.
+    The private key is encrypted using the provided key_password.
+    If the key files already exist, no new keys are generated.
+    """
+    private_key_filename = f"{username}_private.pem"
+    public_key_filename = f"{username}_public.pem"
+
+    if os.path.exists(private_key_filename) and os.path.exists(public_key_filename):
+        print("RSA key pair already exists.")
+        return
+
+    # Generate RSA key pair.
+    private_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048)
+
+    # Serialize and encrypt the private key using the key_password.
+    with open(private_key_filename, "wb") as f:
+        f.write(private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.BestAvailableEncryption(
+                key_password.encode())
+        ))
+
+    # Serialize the public key (no encryption needed).
+    public_key = private_key.public_key()
+    with open(public_key_filename, "wb") as f:
+        f.write(public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ))
+
+    print("RSA key pair generated and saved (private key is encrypted).")
+
+
+def load_rsa_private_key():
+    """
+    Load the RSA private key using the global SESSION_USERNAME.
+    Uses the cached KEY_PASSWORD from the session to decrypt the private key.
+    If KEY_PASSWORD is not set, prompts the user for it.
+    """
+    global KEY_PASSWORD
+    if not SESSION_USERNAME:
+        print("No user logged in.")
+        return None
+    private_key_filename = f"{SESSION_USERNAME}_private.pem"
+    if not os.path.exists(private_key_filename):
+        print("RSA private key not found. Please register first.")
+        return None
+    if KEY_PASSWORD is None:
+        key_pass = input(
+            "Enter the separate password for decrypting your RSA private key: ").strip()
     else:
-        print("\n=== Online Storage Application Client ===")
-        print("1. Register")
-        print("2. Login")
-        print("3. Quit")
-        print("4. (DEBUGGING for upload file)")
-        print("5. (DEBUGGING for download file)")
+        key_pass = KEY_PASSWORD
+    try:
+        with open(private_key_filename, "rb") as f:
+            private_key = serialization.load_pem_private_key(
+                f.read(),
+                password=key_pass.encode()
+            )
+        KEY_PASSWORD = key_pass
+        return private_key
+    except Exception as e:
+        print("Failed to load private key:", e)
+        return None
+
+
+def get_public_key_from_server(session, target_username=None):
+    """
+    Retrieve the RSA public key for the specified target_username from the server.
+    If target_username is not provided, use the global SESSION_USERNAME.
+    The server must expose an endpoint (e.g. GET /get_public_key?username=...)
+    that returns a JSON response containing the public key in PEM format under the "public_key" field.
+    """
+    if target_username is None:
+        target_username = SESSION_USERNAME
+    try:
+        response = session.get(
+            f"{SERVER_URL}/get_public_key?username={target_username}")
+        if response.status_code != 200:
+            print("Error getting public key from server:",
+                  response.json().get("error"))
+            return None
+        public_key_pem = response.json().get("public_key")
+        if not public_key_pem:
+            print("Public key not found in server response.")
+            return None
+        public_key = serialization.load_pem_public_key(public_key_pem.encode())
+        return public_key
+    except Exception as e:
+        print("Error fetching public key from server:", e)
+        return None
+
+
+def print_menu_logged_out():
+    print("\n=== Online Storage Application ===")
+    print("1. Register")
+    print("2. Login")
+    print("3. Quit")
+
+
+def print_menu_admin():
+    print(f"\n=== Welcome, {SESSION_USERNAME}! ===")
+    print("1. View Logs")
+    print("2. Logout")
+
+
+def print_menu_logged_in():
+    print(f"\n=== Welcome, {SESSION_USERNAME}! ===")
+    print("1. Upload File")
+    print("2. List Files")
+    print("3. Download File")
+    print("4. Edit File")
+    print("5. Share File")
+    print("6. Delete File")
+    print("7. Reset Password")
+    print("8. Logout")
 
 
 def register():
     print("\n--- Register ---")
     username = input("Enter username: ").strip()
-    password = getpass.getpass("Enter password: ").strip()
-    
-    # Check password length
-    if len(password) < 10:
-        print("Error: Password must be at least 10 characters long.")
+    # Check if username already exists.
+    try:
+        response = requests.get(
+            f"{SERVER_URL}/check_username?username={username}")
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("exists", False):
+                print("Username already exists. Please choose a different username.")
+                return
+        else:
+            print("Error checking username uniqueness. Please try again later.")
+            return
+    except Exception as e:
+        print("Error checking username uniqueness:", e)
         return
-        
-    password_confirm = getpass.getpass("Confirm password: ").strip()
-    
-    # Password confirmation check
-    if password != password_confirm:
-        print("Error: Passwords do not match.")
-        return
-        
-    data = {"username": username, "password": password}
+    login_pass = input("Enter login password: ").strip()
+    key_pass = input(
+        "Enter a separate password for encrypting your RSA private key: ").strip()
+
+    # Generate RSA key pair using the separate key password.
+    generate_rsa_keys(username, key_pass)
+    # Load the public key from local file.
+    public_key_filename = f"{username}_public.pem"
+    with open(public_key_filename, "rb") as f:
+        public_key = serialization.load_pem_public_key(f.read())
+    # Serialize the public key to a PEM-formatted string.
+    public_key_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode('utf-8')
+
+    data = {"username": username, "password": login_pass,
+            "public_key": public_key_pem}
     try:
         response = requests.post(f"{SERVER_URL}/register", json=data)
-        if response.status_code == 200:
-            print("Success:", response.json().get("message"))
-        else:
-            print("Error:", response.json().get(
-                "error", "Registration failed."))
+        resp = response.json()
+        print(resp.get("message") or resp.get("error"))
     except Exception as e:
         print("Connection error:", e)
 
 
-def login():
-    global loggedInUsername 
-    global loggedInPassword
+def login(session):
+    """
+    Log in the user and cache the password and username in the session.
+    Also ensure that an RSA key pair exists for the user.
+    """
+    global SESSION_USERNAME
     print("\n--- Login ---")
     username = input("Enter username: ").strip()
-    
-    # Check if account is locked due to too many failed attempts
-    if username in login_attempts and login_attempts[username] >= MAX_LOGIN_ATTEMPTS:
-        print(f"Error: Account temporarily locked due to {MAX_LOGIN_ATTEMPTS} failed login attempts.")
-        print("Please try again later or reset your password.")
-        return
-    
-    password = getpass.getpass("Enter password: ").strip()
+    password = input("Enter password: ").strip()
     data = {"username": username, "password": password}
     try:
-        response = requests.post(f"{SERVER_URL}/login", json=data)
+        response = session.post(f"{SERVER_URL}/login", json=data)
+        resp = response.json()
         if response.status_code == 200:
-            print("Success:", response.json().get("message"))
-            loggedInUsername = username 
-            loggedInPassword = password
-            # Reset login attempts on successful login
-            if username in login_attempts:
-                login_attempts[username] = 0
+            print(resp.get("message"))
+            # Cache the username in memory for the session.
+            SESSION_USERNAME = username
+            return username
         else:
-            # Increment failed login attempts
-            if username not in login_attempts:
-                login_attempts[username] = 1
-            else:
-                login_attempts[username] += 1
-                
-            attempts_left = MAX_LOGIN_ATTEMPTS - login_attempts[username]
-            if attempts_left > 0:
-                print(f"Error: {response.json().get('error', 'Login failed.')} ({attempts_left} attempts remaining)")
-            else:
-                print(f"Error: Maximum login attempts reached. Account temporarily locked.")
+            print("Error:", resp.get("error"))
+            return None
+    except Exception as e:
+        print("Connection error:", e)
+        return None
+
+
+def logout(session):
+    global SESSION_USERNAME, KEY_PASSWORD
+    try:
+        response = session.post(f"{SERVER_URL}/logout")
+        print(response.json().get("message"))
+    except Exception as e:
+        print("Connection error:", e)
+    # Clear the cached session data.
+    SESSION_USERNAME = None
+    KEY_PASSWORD = None
+
+
+def upload_file(session):
+    print("\n--- Upload File ---")
+    file_path = input("Enter path of file to upload: ").strip()
+    if not os.path.exists(file_path):
+        print("File does not exist.")
+        return
+    filename = os.path.basename(file_path)
+    # Read file data.
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+    # Generate a random 256-bit AES key.
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+    nonce = os.urandom(12)  # recommended nonce size for AES-GCM.
+    # Encrypt the file data. The result contains ciphertext and an authentication tag.
+    encrypted_file_data = aesgcm.encrypt(nonce, file_data, None)
+    # Prepend the nonce so that it is available for decryption.
+    encrypted_file = nonce + encrypted_file_data
+    # Get the public key from the server.
+    public_key = get_public_key_from_server(session)
+    if public_key is None:
+        return
+    # Encrypt the AES key with the retrieved RSA public key.
+    encrypted_aes_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None
+        )
+    )
+    # Base64 encode the encrypted AES key for safe transport.
+    enc_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
+    files = {
+        'file': (filename, encrypted_file)
+    }
+    data = {
+        'filename': filename,
+        'enc_aes_key': enc_aes_key_b64
+    }
+    try:
+        response = session.post(
+            f"{SERVER_URL}/upload_file", data=data, files=files)
+        print(response.json().get("message") or response.json().get("error"))
     except Exception as e:
         print("Connection error:", e)
 
 
-def reset_password():
+def list_files(session):
+    try:
+        response = session.get(f"{SERVER_URL}/list_files")
+        if response.status_code == 200:
+            files = response.json().get("files", [])
+            if not files:
+                print("No files found.")
+            else:
+                print("\nYour files:")
+                for f in files:
+                    # If the 'shared_by' field exists and is non-empty, display it.
+                    if "shared_by" in f and f["shared_by"]:
+                        print(
+                            f"ID: {f['id']}, Filename: {f['filename']} (Shared by: {f['shared_by']})")
+                    else:
+                        print(f"ID: {f['id']}, Filename: {f['filename']}")
+            return files
+        else:
+            print("Error:", response.json().get("error"))
+            return []
+    except Exception as e:
+        print("Connection error:", e)
+        return []
+
+
+def download_file(session):
+    """
+    Download a file from the server.
+    Uses the cached password to load the RSA private key for decrypting the AES key.
+    """
+    print("\n--- Download File ---")
+    files = list_files(session)
+    if not files:
+        return
+    file_id = input("Enter the ID of the file to download: ").strip()
+    try:
+        data = {"file_id": file_id}
+        response = session.post(f"{SERVER_URL}/download_file", json=data)
+        if response.status_code != 200:
+            print("Error:", response.json().get("error"))
+            return
+        resp = response.json()
+        filename = resp.get("filename")
+        enc_aes_key_b64 = resp.get("enc_aes_key")
+        file_content_b64 = resp.get("file_content")
+
+        # Decode the encrypted AES key and file content.
+        encrypted_aes_key = base64.b64decode(enc_aes_key_b64)
+        encrypted_file = base64.b64decode(file_content_b64)
+
+        # Load the RSA private key using the cached password.
+        private_key = load_rsa_private_key()
+        if not private_key:
+            print("Unable to load private key. Aborting download.")
+            return
+
+        # Decrypt the AES key using RSA OAEP.
+        aes_key = private_key.decrypt(
+            encrypted_aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        # Extract the nonce (first 12 bytes) from the encrypted file.
+        nonce = encrypted_file[:12]
+        ciphertext = encrypted_file[12:]
+        aesgcm = AESGCM(aes_key)
+        decrypted_file = aesgcm.decrypt(nonce, ciphertext, None)
+
+        # Save the decrypted file locally.
+        output_path = f"downloaded_{filename}"
+        with open(output_path, "wb") as f:
+            f.write(decrypted_file)
+        print(f"File downloaded and saved as {output_path}")
+    except Exception as e:
+        print("Error during download:", e)
+
+
+def reset_password_logged_in(session):
     print("\n--- Reset Password ---")
-    username = input("Enter username: ").strip()
-    old_password = getpass.getpass("Enter current password: ").strip()
-    new_password = getpass.getpass("Enter new password: ").strip()
-    
-    # Check password length
-    if len(new_password) < 10:
-        print("Error: Password must be at least 10 characters long.")
-        return
-        
-    confirm_password = getpass.getpass("Confirm new password: ").strip()
-    
-    # Password confirmation check
-    if new_password != confirm_password:
-        print("Error: New passwords do not match.")
-        return
-        
-    data = {"username": username, "old_password": old_password,
-            "new_password": new_password}
+    old_password = input("Enter current password: ").strip()
+    new_password = input("Enter new password: ").strip()
+    data = {"old_password": old_password, "new_password": new_password}
     try:
-        response = requests.post(f"{SERVER_URL}/reset_password", json=data)
-        if response.status_code == 200:
-            print("Success:", response.json().get("message"))
-            # Reset login attempts after successful password reset
-            if username in login_attempts:
-                login_attempts[username] = 0
-        else:
-            print("Error:", response.json().get(
-                "error", "Password reset failed."))
+        response = session.post(f"{SERVER_URL}/reset_password", json=data)
+        print(response.json().get("message") or response.json().get("error"))
     except Exception as e:
         print("Connection error:", e)
 
-def encryptFunction(data):
-    salt = os.urandom(16) # Generate the 16 bytes (128 bits) random data as the salt
 
-    # Use PBKDF2HMAC to generate the secret key
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
-    AES_k = kdf.derive(loggedInPassword.encode()) # Use the logged-in password as the password for PBKDF2HMAC
+def edit_file(session):
+    print("\n--- Edit File ---")
+    # List files for the user.
+    files = list_files(session)
+    if not files:
+        return
+    file_id = input("Enter the ID of the file you want to edit: ").strip()
 
-    AES_iv = os.urandom(16) # Generate the 16 bytes (128 bits) random data as the initialization vector of AES
+    # Ask the user if they want to update the filename.
+    new_filename = input(
+        "Enter new filename (leave empty to keep current): ").strip()
 
-    cipher = Cipher(algorithms.AES(AES_k), modes.CBC(AES_iv))
-    encryptor = cipher.encryptor()
+    # Ask whether to update file content.
+    update_content = input(
+        "Do you want to update the file content? (y/n): ").strip().lower()
 
-    padLength = 16 - (len(data) % 16) # Calculate the number of bytes needed for padding to ensure the data length is a multiple of 16 bytes
-    data = data + bytes([0] * (padLength - 1)) + bytes([padLength]) # Use ZeroLength to pad the data
+    update_fields = {}
+    if new_filename:
+        update_fields['filename'] = new_filename
 
-    ciphertext = encryptor.update(data) + encryptor.finalize()
+    if update_content == 'y':
+        file_path = input("Enter the path of the new file content: ").strip()
+        if not os.path.exists(file_path):
+            print("File does not exist.")
+            return
+        # Read new file data.
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+        # Generate a random 256-bit AES key.
+        aes_key = AESGCM.generate_key(bit_length=256)
+        aesgcm = AESGCM(aes_key)
+        nonce = os.urandom(12)  # AES-GCM recommended nonce size
+        encrypted_file_data = aesgcm.encrypt(nonce, file_data, None)
+        # Prepend the nonce to the ciphertext.
+        encrypted_file = nonce + encrypted_file_data
 
-    encryptedData = salt + AES_iv + ciphertext
+        # Encrypt the AES key with the public key from the server.
+        public_key = get_public_key_from_server(session)
+        if public_key is None:
+            return
+        encrypted_aes_key = public_key.encrypt(
+            aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        # Base64 encode the encrypted AES key.
+        enc_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
+        update_fields['enc_aes_key'] = enc_aes_key_b64
+        # Include the new file under the field name "file".
+        update_fields['file'] = (os.path.basename(file_path), encrypted_file)
 
-    return encryptedData
+    if not new_filename and update_content != 'y':
+        print("No update provided.")
+        return
 
-def decryptFunction(encryptedData):
-    salt = encryptedData[:16] # Get the first 16 bytes of encryptedData as the salt
-    AES_iv = encryptedData[16:32] # Get the next 16 bytes of encryptedData as the initialization vector
-    ciphertext = encryptedData[32:] # Get the remaining of encryptedData as the ciphertext
+    # Build the form data for the POST request.
+    data = {"file_id": file_id}
+    if 'filename' in update_fields:
+        data['filename'] = update_fields['filename']
+    if 'enc_aes_key' in update_fields:
+        data['enc_aes_key'] = update_fields['enc_aes_key']
 
-    # Use PBKDF2HMAC to generate the secret key
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000, backend=default_backend())
-    AES_k = kdf.derive(loggedInPassword.encode()) # Use the logged-in password as the password for PBKDF2HMAC
+    files_field = None
+    if 'file' in update_fields:
+        files_field = {"file": update_fields['file']}
 
-    cipher = Cipher(algorithms.AES(AES_k), modes.CBC(AES_iv))
-    decryptor = cipher.decryptor()
-    decryptedData = decryptor.update(ciphertext) + decryptor.finalize()
-
-    padLength = decryptedData[-1] # Get the padded length from the last byte of data
-
-    return decryptedData[:-padLength] # Return the data without padding
-
-def encryptFile(inputFile, outputFile):
-    with open(inputFile, 'rb') as f: # Open the input file in binary read mode
-        data = f.read() # Read the input file
-        encryptedData = encryptFunction(data) # Encrypt the data of the input file
-    
-    with open(outputFile, 'wb') as f: # Open the output file in binary write mode
-        f.write(encryptedData) # Write the encrypted data to the output file
-
-def decryptFile(inputFile, outputFile):
-    with open(inputFile, 'rb') as f: # Open the input file in binary read mode
-        data = f.read() # Read the input file
-        decryptedData = decryptFunction(data) # Decrypt the data of the input file
-    
-    with open(outputFile, 'wb') as f: # Open the output file in binary write mode
-        f.write(decryptedData) # Write the decrypted data to the output file
-
-def uploadFileToServer(filePath, username):
-    encryptFile(filePath, filePath + '.enc')  # Encrypt the file before uploading
-    filePath += '.enc'  # Change the file path to the encrypted file path
     try:
-        with open(filePath, 'rb') as f:  # Open the file in binary read mode
-            files = {'file': f}
-            data = {'username': username}
-            
-            response = requests.post(f"{SERVER_URL}/upload", files=files, data=data)  # Send a POST request to the server
-        
-        response.raise_for_status()  # Check for HTTP errors
-        return response.json()  # Return JSON response
+        response = session.post(
+            f"{SERVER_URL}/edit_file", data=data, files=files_field)
+        resp = response.json()
+        print(resp.get("message") or resp.get("error"))
     except Exception as e:
-        return {'error': str(e)}
-    finally:
-        if os.path.exists(filePath):  # Ensure the encrypted file is deleted
-            os.remove(filePath)
+        print("Connection error:", e)
 
-def downloadFileFromServer(username, filename):
+
+def share_file(session):
+    """
+    Shares one of the current user's files with a designated recipient.
+    The function:
+      1. Lists the current user's files and prompts for a file ID to share.
+      2. Prompts for the target username.
+      3. Downloads and decrypts the chosen file.
+      4. Re-encrypts the file with a new AES key.
+      5. Encrypts the new AES key with the target user's public key.
+      6. Uploads the re-encrypted file and the new encrypted key to the server via the /share_file endpoint.
+    """
+    print("\n--- Share File ---")
+    files = list_files(session)
+    if not files:
+        return
+    original_file_id = input(
+        "Enter the ID of the file you want to share: ").strip()
+    target_username = input("Enter the username to share with: ").strip()
+    # Fetch the target user's public key from the server.
+    target_public_key = get_public_key_from_server(
+        session, target_username)
+    if target_public_key is None:
+        print("Failed to retrieve target user's public key.")
+        return
+    # Step 1: Download and decrypt the file using the current user's keys.
     try:
-        response = requests.get(f"{SERVER_URL}/download", params={'username': username, 'filename': filename})  # Send a GET request to the server
-        response.raise_for_status()  # Check for HTTP errors
-        encryptedFilePath = filename  # Create a temporary file path
-        decryptedFilePath = encryptedFilePath[:-4]  # Remove the '.enc' extension from the filename
-        with open(encryptedFilePath, 'wb') as f:
-            f.write(response.content)  # Write the file content to a temporary file
-        decryptFile(encryptedFilePath, decryptedFilePath)  # Decrypt the file after downloading
-        os.remove(encryptedFilePath)  # Remove the temporary file
-        return {'message': 'File downloaded successfully'}
+        data = {"file_id": original_file_id}
+        response = session.post(f"{SERVER_URL}/download_file", json=data)
+        if response.status_code != 200:
+            print("Error:", response.json().get("error"))
+            return
+        resp = response.json()
+        filename = resp.get("filename")
+        enc_aes_key_b64 = resp.get("enc_aes_key")
+        file_content_b64 = resp.get("file_content")
+        # Decode the encrypted AES key and file data.
+        encrypted_aes_key = base64.b64decode(enc_aes_key_b64)
+        encrypted_file = base64.b64decode(file_content_b64)
+        # Load own RSA private key.
+        private_key = load_rsa_private_key()
+        if not private_key:
+            print("Unable to load private key. Aborting share.")
+            return
+        # Decrypt the original AES key.
+        aes_key = private_key.decrypt(
+            encrypted_aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        # Decrypt the file using AES-GCM.
+        nonce = encrypted_file[:12]
+        ciphertext = encrypted_file[12:]
+        aesgcm = AESGCM(aes_key)
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
     except Exception as e:
-        return {'error': str(e)}
+        print("Error during file decryption:", e)
+        return
 
-# DEBUG
-def uploadFile():
-    filePath = input("Enter file path: ").strip()
-    response = uploadFileToServer(filePath, loggedInUsername)
-    print(f'Server response: {response}')  # Print the server response
+    # Step 2: Re-encrypt the file for the target user.
+    try:
+        # Generate a new AES key for the target user.
+        new_aes_key = AESGCM.generate_key(bit_length=256)
+        new_aesgcm = AESGCM(new_aes_key)
+        new_nonce = os.urandom(12)
+        new_encrypted_file_data = new_aesgcm.encrypt(
+            new_nonce, plaintext, None)
+        new_encrypted_file = new_nonce + new_encrypted_file_data
+        # Encrypt the new AES key with the target user's public key.
+        new_encrypted_aes_key = target_public_key.encrypt(
+            new_aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        new_enc_aes_key_b64 = base64.b64encode(
+            new_encrypted_aes_key).decode('utf-8')
+    except Exception as e:
+        print("Error during file re-encryption:", e)
+        return
 
-def downloadFile():
-    filename = input("Enter filename: ").strip()
-    response = downloadFileFromServer(loggedInUsername, filename + '.enc')
-    print(f'Server response: {response}')  # Print the server response
-# DEBUG
+    # Step 3: Upload the re-encrypted file as a shared file.
+    try:
+        files_field = {"file": (filename, new_encrypted_file)}
+        share_data = {
+            "original_file_id": original_file_id,
+            "target_username": target_username,
+            "filename": filename,
+            "enc_aes_key": new_enc_aes_key_b64
+        }
+        response = session.post(
+            f"{SERVER_URL}/share_file", data=share_data, files=files_field)
+        print(response.json().get("message") or response.json().get("error"))
+    except Exception as e:
+        print("Connection error during file sharing:", e)
+
+
+def delete_file(session):
+    print("\n--- Delete File ---")
+    files = list_files(session)
+    if not files:
+        return
+    file_id = input("Enter the ID of the file to delete: ").strip()
+    confirm = input(
+        "Are you sure you want to delete this file? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Deletion cancelled.")
+        return
+    try:
+        data = {"file_id": file_id}
+        response = session.post(f"{SERVER_URL}/delete_file", json=data)
+        if response.status_code == 200:
+            print(response.json().get("message"))
+        else:
+            print("Error:", response.json().get("error"))
+    except Exception as e:
+        print("Connection error:", e)
+
+
+def view_logs(session):
+    try:
+        response = session.get(f"{SERVER_URL}/get_logs")
+        if response.status_code == 200:
+            logs = response.json().get("logs", [])
+            for log in logs:
+                print(
+                    f"{log['timestamp']} - {log['username']} - {log['operation']} - {log['details']} (Hash: {log['log_hash']})")
+        else:
+            print("Error:", response.json().get("error"))
+    except Exception as e:
+        print("Connection error:", e)
+
 
 def main():
-    global loggedInUsername, loggedInPassword
+    # Using a persistent requests.Session to store cookies.
+    session = requests.Session()
     while True:
-        print_menu()
-        if loggedInUsername:
-            choice = input("Enter your choice (1-5): ").strip()
-            if choice == '1':
-                reset_password()
-            elif choice == '2':
-                uploadFile()
-            elif choice == '3':
-                downloadFile()
-            elif choice == '4':
-                print(f"Logging out user: {loggedInUsername}")
-                loggedInUsername = None
-                loggedInPassword = None
-            elif choice == '5':
-                print("Exiting the application.")
-                break
-            else:
-                print("Invalid choice. Please try again.")
-        else:
-            choice = input("Enter your choice (1-5): ").strip()
+        if not SESSION_USERNAME:
+            print_menu_logged_out()
+            choice = input("Enter choice: ").strip()
             if choice == '1':
                 register()
             elif choice == '2':
-                login()
+                login(session)
             elif choice == '3':
-                print("Exiting the application.")
+                print("Exiting application.")
                 break
-            # DEBUG
-            elif choice == '4':
-                print("You must login first.")
-            elif choice == '5':
-                print("You must login first.")
-            #DEBUG
             else:
-                print("Invalid choice. Please try again.")
+                print("Invalid choice. Try again.")
+        elif SESSION_USERNAME == "admin":
+            print_menu_admin()
+            choice = input("Enter choice: ").strip()
+            if choice == '1':
+                view_logs(session)
+            elif choice == '2':
+                logout(session)
+            else:
+                print("Invalid choice. Try again.")
+        else:
+            print_menu_logged_in()
+            choice = input("Enter choice: ").strip()
+            if choice == '1':
+                upload_file(session)
+            elif choice == '2':
+                list_files(session)
+            elif choice == '3':
+                download_file(session)
+            elif choice == '4':
+                edit_file(session)
+            elif choice == '5':
+                share_file(session)
+            elif choice == '6':
+                delete_file(session)
+            elif choice == '7':
+                reset_password_logged_in(session)
+            elif choice == '8':
+                logout(session)
+            else:
+                print("Invalid choice. Try again.")
 
 
 if __name__ == '__main__':

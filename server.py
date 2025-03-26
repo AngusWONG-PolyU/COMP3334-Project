@@ -1,60 +1,134 @@
-from flask import Flask, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+from flask import Flask, request, jsonify, make_response
 import sqlite3
 import hashlib
 import os
+import hmac
+import time
+from functools import wraps
+import base64
 
 app = Flask(__name__)
 DATABASE = 'database.db'
+SERVER_SECRET = os.urandom(32)  # used for signing session cookies
+# A server secret used to sign the logs. Keep this secure.
+LOG_SECRET = b'super_secret_log_key'
 
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row  # Enable accessing columns by name.
+    conn.row_factory = sqlite3.Row  # enable dictionary-like access to columns
     return conn
 
-def get_user_id_by_username(username):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id FROM users WHERE username = ?', (username,))
-    user = cur.fetchone()
-    conn.close()
-    
-    if user:
-        return user['id']
-    return None
 
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Create the user table
+    # Create the users table.
+    # Note: public_key is allowed to be NULL.
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            public_key TEXT
         );
     ''')
 
-    # Create the files table
+    # Create the files table.
     cur.execute('''
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            owner TEXT NOT NULL,
             filename TEXT NOT NULL,
-            data BLOB NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            enc_aes_key TEXT NOT NULL,
+            file_data BLOB NOT NULL,
+            shared_by TEXT DEFAULT NULL
         );
     ''')
+
+    # Create the logs table.
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            username TEXT,
+            operation TEXT,
+            details TEXT,
+            log_hash TEXT
+        );
+    ''')
+
+    # Insert admin user if not exists.
+    cur.execute("SELECT * FROM users WHERE username = 'admin'")
+    if cur.fetchone() is None:
+        admin_username = "admin"
+        # For demonstration only—use a strong password in production.
+        admin_password = "admin"
+        hashed_admin_password = hash_password(admin_password)
+        # Insert admin user with public_key set to NULL.
+        cur.execute("INSERT INTO users (username, password, public_key) VALUES (?, ?, ?)",
+                    (admin_username, hashed_admin_password, None))
 
     conn.commit()
     conn.close()
 
 
+def get_last_log_hash():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT log_hash FROM logs ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    return row["log_hash"] if row else ""
+
+
+def log_operation(username, operation, details):
+    """
+    Records a log entry in the logs table.
+    Computes a hash for non-repudiation that chains with the previous log hash.
+    """
+    last_hash = get_last_log_hash()
+    # Prepare a string that includes the operation details, timestamp, username, etc.
+    # (Note: In a real application, you might include the timestamp, but here we assume the DB timestamp.)
+    log_string = f"{username}|{operation}|{details}|{last_hash}|{LOG_SECRET.decode()}"
+    # Compute SHA-256 hash.
+    log_hash = hashlib.sha256(log_string.encode()).hexdigest()
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO logs (username, operation, details, log_hash)
+        VALUES (?, ?, ?, ?)
+    """, (username, operation, details, log_hash))
+    conn.commit()
+    conn.close()
+
+
+@app.route('/get_public_key', methods=['GET'])
+def get_public_key():
+    username = request.args.get('username')
+    if not username:
+        return jsonify({'error': 'Username is required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT public_key FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({'error': 'User not found'}), 404
+
+    public_key = row['public_key']
+    return jsonify({'public_key': public_key})
+
+
 def hash_password(password):
     """
-    Hash the provided password using PBKDF2_HMAC with a random salt.
-    Returns a string in the format "salt$hash", where both parts are hex encoded.
+    Hash a password using PBKDF2_HMAC with a random salt.
+    Returns a string in the format: "salt$hash".
     """
     salt = os.urandom(16)
     hashed = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
@@ -64,7 +138,6 @@ def hash_password(password):
 def verify_password(stored_password, provided_password):
     """
     Verify a provided password against the stored hash.
-    The stored password is expected in the format "salt$hash".
     """
     try:
         salt_hex, hash_hex = stored_password.split('$')
@@ -76,21 +149,90 @@ def verify_password(stored_password, provided_password):
     return new_hash.hex() == hash_hex
 
 
+def generate_session_cookie(username):
+    """
+    Generates a session cookie containing the username and an expiration timestamp,
+    and appends an HMAC signature.
+    """
+    expiration = int(time.time()) + 3600  # valid for 1 hour
+    session_data = f"{username}:{expiration}"
+    signature = hmac.new(SERVER_SECRET, session_data.encode(),
+                         hashlib.sha256).hexdigest()
+    cookie = f"{session_data}:{signature}"
+    return cookie
+
+
+def verify_session_cookie(cookie):
+    """
+    Verifies that the session cookie is intact and not expired.
+    Returns the username if valid, or None otherwise.
+    """
+    try:
+        parts = cookie.split(':')
+        if len(parts) != 3:
+            return None
+        username, expiration, signature = parts
+        session_data = f"{username}:{expiration}"
+        expected_signature = hmac.new(
+            SERVER_SECRET, session_data.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_signature, signature):
+            return None
+        if int(expiration) < time.time():
+            return None
+        return username
+    except Exception:
+        return None
+
+
+def require_login(f):
+    """
+    A decorator that checks for a valid session cookie.
+    Attaches the username (from the cookie) to the request object.
+    """
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        cookie = request.cookies.get('session')
+        if not cookie:
+            return jsonify({'error': 'Authentication required'}), 401
+        username = verify_session_cookie(cookie)
+        if not username:
+            return jsonify({'error': 'Invalid or expired session'}), 401
+        request.username = username
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route('/check_username', methods=['GET'])
+def check_username():
+    username = request.args.get('username')
+    if not username:
+        return jsonify({'error': 'Missing username parameter'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+    exists = cur.fetchone() is not None
+    conn.close()
+
+    return jsonify({'exists': exists})
+
+
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
+    public_key = data.get('public_key')  # New field: user's RSA public key
 
-    if not username or not password:
-        return jsonify({'error': 'Username and password required'}), 400
+    if not username or not password or not public_key:
+        return jsonify({'error': 'Username, password, and public key are required'}), 400
 
     hashed_password = hash_password(password)
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('INSERT INTO users (username, password) VALUES (?, ?)',
-                    (username, hashed_password))
+        cur.execute('INSERT INTO users (username, password, public_key) VALUES (?, ?, ?)',
+                    (username, hashed_password, public_key))
         conn.commit()
         return jsonify({'message': 'User registered successfully'})
     except sqlite3.IntegrityError:
@@ -104,30 +246,28 @@ def login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
-
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('SELECT * FROM users WHERE username = ?', (username,))
     user = cur.fetchone()
     conn.close()
-
-    if user is None:
+    if user is None or not verify_password(user['password'], password):
         return jsonify({'error': 'Invalid username or password'}), 401
-
-    stored_password = user['password']
-    if verify_password(stored_password, password):
-        return jsonify({'message': 'Logged in successfully'})
-    else:
-        return jsonify({'error': 'Invalid username or password'}), 401
+    cookie = generate_session_cookie(username)
+    response = make_response(jsonify({'message': 'Logged in successfully'}))
+    response.set_cookie('session', cookie, httponly=True, samesite='Strict')
+    log_operation(username, "login",
+                  f"User {username} logged in.")
+    return response
 
 
 @app.route('/reset_password', methods=['POST'])
+@require_login
 def reset_password():
     data = request.get_json()
-    username = data.get('username')
+    username = request.username
     old_password = data.get('old_password')
     new_password = data.get('new_password')
 
@@ -156,94 +296,267 @@ def reset_password():
 
     return jsonify({'message': 'Password reset successfully'})
 
-def save_file_to_db(user_id, filename, data):
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO files (user_id, filename, data) VALUES (?, ?, ?)', (user_id, filename, data))
-        conn.commit()
-    except sqlite3.Error as e:
-        return jsonify({'error': str(e)}), 500
-    finally:
-        conn.close()
 
-def get_file_from_db(user_id, filename):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT data FROM files WHERE user_id = ? AND filename = ?', (user_id, filename))
-    file = cur.fetchone()
-    conn.close()
-    
-    if file:
-        return file['data']
-    return None
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    # Check if a file part is present in the request
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-    
-    file = request.files['file']
-    
-    # Check if a filename is provided
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    username = request.form.get('username')  # Get the username from form data
-    
-    if username is None:
-        return jsonify({'error': 'Username is required'}), 400  # Check if username is provided
-
-    user_id = get_user_id_by_username(username) # Get the user_id based on the username
-    
-    if user_id is None:
-        return jsonify({'error': 'User not found'}), 404  # Return error if user is not found
-    
-    file_data = file.read()  # Read the file data
-    
-    response = save_file_to_db(user_id, file.filename, file_data)
-    if response is not None: # If an error occurred while saving the file to the database
-        return response
-    
-    return jsonify({'message': 'File uploaded successfully'}), 201
-
-temp_files = set() # Set to track temporary files
-
-@app.after_request
-def remove_temp_files(response):
-    for file in temp_files:
-        if os.path.exists(file):
-            os.remove(file)
-    temp_files.clear()
+@app.route('/logout', methods=['POST'])
+@require_login
+def logout():
+    response = make_response(jsonify({'message': 'Logged out successfully'}))
+    response.set_cookie('session', '', expires=0)
+    log_operation(request.username, "logout",
+                  f"User {request.username} logged out.")
     return response
 
-@app.route('/download', methods=['GET'])
-def download_file():
-    username = request.args.get('username') # Get the username from the query parameters
-    filename = request.args.get('filename') # Get the filename from the query parameters
 
-    user_id = get_user_id_by_username(username) # Get the user_id based on the username
-    if user_id is None:
-        return jsonify({'error': 'User not found'}), 404  # Return error if user is not found
-    
-    if filename is None:
-        return jsonify({'error': 'Filename is required'}), 400 # Return error if filename is not provided
-    
-    file_data = get_file_from_db(user_id, filename)  # Get the file data from the database
-    if file_data is None:
-        return jsonify({'error': 'File not found'}), 404 # Return error if file is not found
-    
-    temp_file_path = f'temp_{filename}' # Create a temporary file path
-    with open(temp_file_path, 'wb') as f:
-        f.write(file_data)  # Write the file data to a temporary file
-    
-    temp_files.add(temp_file_path)  # Add the temp file to the tracking set
-    
-    return send_file(temp_file_path, as_attachment=True)  # Send the file as an attachment
-    
+@app.route('/upload_file', methods=['POST'])
+@require_login
+def upload_file():
+    username = request.username
+    # Get the raw filename, encrypted AES key, and file upload.
+    raw_filename = request.form.get('filename')
+    enc_aes_key = request.form.get('enc_aes_key')
+    uploaded_file = request.files.get('file')
+
+    if not raw_filename or not enc_aes_key or not uploaded_file:
+        return jsonify({'error': 'Missing parameters'}), 400
+
+    # Sanitize the filename.
+    filename = secure_filename(raw_filename)
+    if not filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+
+    # Read the file's binary content.
+    file_data = uploaded_file.read()
+
+    # Store the file metadata and binary data in the database.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('INSERT INTO files (owner, filename, enc_aes_key, file_data) VALUES (?, ?, ?, ?)',
+                (username, filename, enc_aes_key, file_data))
+    conn.commit()
+    conn.close()
+    log_operation(username, "upload", f"Uploaded file '{filename}'.")
+    return jsonify({'message': 'File uploaded successfully'})
+
+
+@app.route('/list_files', methods=['GET'])
+@require_login
+def list_files():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Retrieve all files where the logged-in user is the owner.
+    cur.execute(
+        'SELECT id, filename, shared_by FROM files WHERE owner = ?', (request.username,))
+    files = cur.fetchall()
+    conn.close()
+
+    file_list = []
+    for f in files:
+        file_dict = {
+            "id": f["id"],
+            "filename": f["filename"]
+        }
+        # Only include the "shared_by" field if it is not empty or NULL.
+        if f["shared_by"]:
+            file_dict["shared_by"] = f["shared_by"]
+        file_list.append(file_dict)
+
+    return jsonify({"files": file_list})
+
+
+@app.route('/download_file', methods=['POST'])
+@require_login
+def download_file():
+    data = request.get_json()
+    file_id = data.get('file_id')
+    if not file_id:
+        return jsonify({'error': 'Missing file_id'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM files WHERE id = ? AND owner = ?',
+                (file_id, request.username))
+    file_record = cur.fetchone()
+    conn.close()
+
+    if not file_record:
+        return jsonify({'error': 'File not found'}), 404
+
+    # Encode the binary file data for transport.
+    file_content_b64 = base64.b64encode(
+        file_record['file_data']).decode('utf-8')
+    return jsonify({
+        'filename': file_record['filename'],
+        'enc_aes_key': file_record['enc_aes_key'],
+        'file_content': file_content_b64
+    })
+
+
+@app.route('/edit_file', methods=['POST'])
+@require_login
+def edit_file():
+    username = request.username
+    file_id = request.form.get('file_id')
+    if not file_id:
+        return jsonify({'error': 'Missing file_id'}), 400
+
+    # Read new update values from the form.
+    # These fields are optional: user can update filename, encrypted AES key, and/or file content.
+    new_raw_filename = request.form.get('filename')
+    new_enc_aes_key = request.form.get('enc_aes_key')
+    new_file = request.files.get('file')
+
+    # At least one update must be provided.
+    if not new_raw_filename and not new_enc_aes_key and not new_file:
+        return jsonify({'error': 'No update provided'}), 400
+
+    # Sanitize the new filename if provided.
+    new_filename = None
+    if new_raw_filename:
+        new_filename = secure_filename(new_raw_filename)
+        if not new_filename:
+            return jsonify({'error': 'Invalid filename'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Ensure that the file exists and belongs to the logged-in user.
+    cur.execute('SELECT * FROM files WHERE id = ? AND owner = ?',
+                (file_id, username))
+    file_record = cur.fetchone()
+    if not file_record:
+        conn.close()
+        return jsonify({'error': 'File not found or access denied'}), 404
+
+    # Build the update query dynamically based on provided fields.
+    update_fields = []
+    params = []
+
+    if new_filename:
+        update_fields.append('filename = ?')
+        params.append(new_filename)
+    if new_enc_aes_key:
+        update_fields.append('enc_aes_key = ?')
+        params.append(new_enc_aes_key)
+    if new_file:
+        # Read and update the file data.
+        file_data = new_file.read()
+        update_fields.append('file_data = ?')
+        params.append(file_data)
+
+    # If no update fields are provided (this check is redundant due to the earlier check but kept for safety)
+    if not update_fields:
+        conn.close()
+        return jsonify({'error': 'No update fields provided'}), 400
+
+    # Append file_id and owner for the WHERE clause.
+    params.append(file_id)
+    params.append(username)
+    query = f"UPDATE files SET {', '.join(update_fields)} WHERE id = ? AND owner = ?"
+    cur.execute(query, params)
+    conn.commit()
+    conn.close()
+
+    return jsonify({'message': 'File updated successfully'})
+
+
+@app.route('/share_file', methods=['POST'])
+@require_login
+def share_file():
+    """
+    Allows a user to share one of their files with a designated user.
+    Expects form fields:
+      - original_file_id: The ID of the file being shared.
+      - target_username: The recipient's username.
+      - filename: The file name.
+      - enc_aes_key: The new encrypted AES key (base64 encoded) for the recipient.
+    Expects the re-encrypted file data in the file upload field "file".
+    """
+    data = request.form
+    original_file_id = data.get('original_file_id')
+    target_username = data.get('target_username')
+    filename = data.get('filename')
+    enc_aes_key = data.get('enc_aes_key')
+    shared_file = request.files.get('file')
+
+    if not original_file_id or not target_username or not filename or not enc_aes_key or not shared_file:
+        return jsonify({'error': 'Missing parameters'}), 400
+
+    # Verify the current user is the owner of the original file.
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT * FROM files WHERE id = ? AND owner = ?',
+                (original_file_id, request.username))
+    original_file = cur.fetchone()
+    if not original_file:
+        conn.close()
+        return jsonify({'error': 'File not found or access denied'}), 404
+
+    # Read the re-encrypted file data.
+    new_file_data = shared_file.read()
+    # Insert a new record for the shared file.
+    cur.execute('INSERT INTO files (owner, filename, enc_aes_key, file_data, shared_by) VALUES (?, ?, ?, ?, ?)',
+                (target_username, filename, enc_aes_key, new_file_data, request.username))
+    conn.commit()
+    conn.close()
+    log_operation(request.username, "share",
+                  f"Shared file id {original_file_id} with {target_username}.")
+    return jsonify({'message': f'File shared successfully with {target_username}'})
+
+
+@app.route('/delete_file', methods=['POST'])
+@require_login
+def delete_file():
+    data = request.get_json()
+    file_id = data.get("file_id")
+    if not file_id:
+        return jsonify({'error': 'Missing file_id parameter'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Check if the file exists and belongs to the current user.
+    cur.execute("SELECT * FROM files WHERE id = ? AND owner = ?",
+                (file_id, request.username))
+    file_record = cur.fetchone()
+    if not file_record:
+        conn.close()
+        return jsonify({'error': 'File not found or access denied'}), 404
+
+    # Delete the file record.
+    cur.execute("DELETE FROM files WHERE id = ? AND owner = ?",
+                (file_id, request.username))
+    conn.commit()
+    conn.close()
+    log_operation(request.username, "delete",
+                  f"Deleted file with id {file_id}.")
+    return jsonify({'message': 'File deleted successfully'})
+
+
+@app.route('/get_logs', methods=['GET'])
+@require_login
+def get_logs():
+    # For simplicity, assume the admin has username "admin".
+    if request.username != "admin":
+        return jsonify({'error': 'Access denied'}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM logs ORDER BY id DESC")
+    logs = cur.fetchall()
+    conn.close()
+
+    # Convert log rows to a list of dictionaries.
+    log_list = []
+    for row in logs:
+        log_list.append({
+            "id": row["id"],
+            "timestamp": row["timestamp"],
+            "username": row["username"],
+            "operation": row["operation"],
+            "details": row["details"],
+            "log_hash": row["log_hash"]
+        })
+    return jsonify({"logs": log_list})
 
 
 if __name__ == '__main__':
-    init_db()  # Create the database and table if they don't exist.
+    init_db()  # initialize the database and tables if they don't exist
     app.run(debug=True)
