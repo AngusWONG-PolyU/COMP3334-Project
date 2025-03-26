@@ -4,11 +4,13 @@ import requests
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import getpass  
 
 SERVER_URL = 'http://127.0.0.1:5000'
 # Global variables to cache the RSA key encryption password and username during the session.
 KEY_PASSWORD = None
 SESSION_USERNAME = None
+LOGIN_ATTEMPTS = {}  # Dictionary to track login attempts per username
 
 
 def generate_rsa_keys(username, key_password):
@@ -63,7 +65,7 @@ def load_rsa_private_key():
         print("RSA private key not found. Please register first.")
         return None
     if KEY_PASSWORD is None:
-        key_pass = input(
+        key_pass = getpass.getpass(
             "Enter the separate password for decrypting your RSA private key: ").strip()
     else:
         key_pass = KEY_PASSWORD
@@ -132,10 +134,20 @@ def print_menu_logged_in():
     print("8. Logout")
 
 
+def validate_password(password):
+    """
+    Validate password requirements.
+    Returns (bool, str) tuple: (is_valid, error_message)
+    """
+    if len(password) < 10:
+        return False, "Password must be at least 10 characters long"
+    return True, ""
+
+
 def register():
     print("\n--- Register ---")
     username = input("Enter username: ").strip()
-    # Check if username already exists.
+    # Check if username already exists
     try:
         response = requests.get(
             f"{SERVER_URL}/check_username?username={username}")
@@ -150,9 +162,30 @@ def register():
     except Exception as e:
         print("Error checking username uniqueness:", e)
         return
-    login_pass = input("Enter login password: ").strip()
-    key_pass = input(
-        "Enter a separate password for encrypting your RSA private key: ").strip()
+
+    # Get and validate login password
+    while True:
+        login_pass = getpass.getpass("Enter login password (min 10 characters): ").strip()
+        is_valid, error_msg = validate_password(login_pass)
+        if not is_valid:
+            print(f"Invalid password: {error_msg}")
+            continue
+        break
+
+    # Get and validate key password
+    while True:
+        key_pass = getpass.getpass(
+            "Enter a separate password for encrypting your RSA private key (min 10 characters): ").strip()
+        is_valid, error_msg = validate_password(key_pass)
+        if not is_valid:
+            print(f"Invalid key password: {error_msg}")
+            continue
+        
+        # Check if key password is different from login password
+        if key_pass == login_pass:
+            print("Error: Key password must be different from login password")
+            continue
+        break
 
     # Generate RSA key pair using the separate key password.
     generate_rsa_keys(username, key_pass)
@@ -179,24 +212,48 @@ def register():
 def login(session):
     """
     Log in the user and cache the password and username in the session.
-    Also ensure that an RSA key pair exists for the user.
+    Implements a 3-attempt limit before temporarily locking the account.
     """
     global SESSION_USERNAME
     print("\n--- Login ---")
     username = input("Enter username: ").strip()
-    password = input("Enter password: ").strip()
+    
+    # Check if account is in login attempts dict
+    if username not in LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS[username] = 0
+    
+    # Check if account is locked (3 or more failed attempts)
+    if LOGIN_ATTEMPTS[username] >= 3:
+        print("Error: Account is temporarily locked due to too many failed attempts.")
+        print("Please try again later or contact administrator.")
+        return None
+
+    password = getpass.getpass("Enter password: ").strip()
     data = {"username": username, "password": password}
+    
     try:
         response = session.post(f"{SERVER_URL}/login", json=data)
         resp = response.json()
+        
         if response.status_code == 200:
             print(resp.get("message"))
-            # Cache the username in memory for the session.
             SESSION_USERNAME = username
+            # Reset attempts on successful login
+            LOGIN_ATTEMPTS[username] = 0
             return username
         else:
-            print("Error:", resp.get("error"))
+            # Increment failed attempts
+            LOGIN_ATTEMPTS[username] += 1
+            remaining_attempts = 3 - LOGIN_ATTEMPTS[username]
+            
+            if remaining_attempts > 0:
+                print(f"Error: {resp.get('error')}")
+                print(f"Remaining attempts: {remaining_attempts}")
+            else:
+                print("Account has been locked due to too many failed attempts.")
+                print("Please try again later or contact administrator.")
             return None
+            
     except Exception as e:
         print("Connection error:", e)
         return None
@@ -209,9 +266,10 @@ def logout(session):
         print(response.json().get("message"))
     except Exception as e:
         print("Connection error:", e)
-    # Clear the cached session data.
+    # Clear the cached session data
     SESSION_USERNAME = None
     KEY_PASSWORD = None
+    # Don't reset login attempts on logout to maintain the lock
 
 
 def upload_file(session):
@@ -344,8 +402,16 @@ def download_file(session):
 
 def reset_password_logged_in(session):
     print("\n--- Reset Password ---")
-    old_password = input("Enter current password: ").strip()
-    new_password = input("Enter new password: ").strip()
+    old_password = getpass.getpass("Enter current password: ").strip()
+    
+    while True:
+        new_password = getpass.getpass("Enter new password (min 10 characters): ").strip()
+        is_valid, error_msg = validate_password(new_password)
+        if not is_valid:
+            print(f"Invalid password: {error_msg}")
+            continue
+        break
+
     data = {"old_password": old_password, "new_password": new_password}
     try:
         response = session.post(f"{SERVER_URL}/reset_password", json=data)
