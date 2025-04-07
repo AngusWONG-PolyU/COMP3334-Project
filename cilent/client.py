@@ -4,13 +4,12 @@ import requests
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import getpass  
+import getpass
 
-SERVER_URL = 'http://127.0.0.1:5000'
+SERVER_URL = 'https://127.0.0.1:5000'
 # Global variables to cache the RSA key encryption password and username during the session.
 KEY_PASSWORD = None
 SESSION_USERNAME = None
-LOGIN_ATTEMPTS = {}  # Dictionary to track login attempts per username
 
 
 def generate_rsa_keys(username, key_password):
@@ -93,7 +92,7 @@ def get_public_key_from_server(session, target_username=None):
         target_username = SESSION_USERNAME
     try:
         response = session.get(
-            f"{SERVER_URL}/get_public_key?username={target_username}")
+            f"{SERVER_URL}/get_public_key?username={target_username}", verify="cert.pem")
         if response.status_code != 200:
             print("Error getting public key from server:",
                   response.json().get("error"))
@@ -139,7 +138,8 @@ def validate_password(password):
     Validate password requirements.
     Returns (bool, str) tuple: (is_valid, error_message)
     """
-    if len(password) < 10:
+    # TODO: Change back to 10
+    if len(password) < 1:
         return False, "Password must be at least 10 characters long"
     return True, ""
 
@@ -150,7 +150,7 @@ def register():
     # Check if username already exists
     try:
         response = requests.get(
-            f"{SERVER_URL}/check_username?username={username}")
+            f"{SERVER_URL}/check_username?username={username}", verify="cert.pem")
         if response.status_code == 200:
             data = response.json()
             if data.get("exists", False):
@@ -165,7 +165,8 @@ def register():
 
     # Get and validate login password
     while True:
-        login_pass = getpass.getpass("Enter login password (min 10 characters): ").strip()
+        login_pass = getpass.getpass(
+            "Enter login password (min 10 characters): ").strip()
         is_valid, error_msg = validate_password(login_pass)
         if not is_valid:
             print(f"Invalid password: {error_msg}")
@@ -180,7 +181,7 @@ def register():
         if not is_valid:
             print(f"Invalid key password: {error_msg}")
             continue
-        
+
         # Check if key password is different from login password
         if key_pass == login_pass:
             print("Error: Key password must be different from login password")
@@ -202,7 +203,8 @@ def register():
     data = {"username": username, "password": login_pass,
             "public_key": public_key_pem}
     try:
-        response = requests.post(f"{SERVER_URL}/register", json=data)
+        response = requests.post(
+            f"{SERVER_URL}/register", json=data, verify="cert.pem")
         resp = response.json()
         print(resp.get("message") or resp.get("error"))
     except Exception as e:
@@ -212,48 +214,24 @@ def register():
 def login(session):
     """
     Log in the user and cache the password and username in the session.
-    Implements a 3-attempt limit before temporarily locking the account.
     """
     global SESSION_USERNAME
     print("\n--- Login ---")
     username = input("Enter username: ").strip()
-    
-    # Check if account is in login attempts dict
-    if username not in LOGIN_ATTEMPTS:
-        LOGIN_ATTEMPTS[username] = 0
-    
-    # Check if account is locked (3 or more failed attempts)
-    if LOGIN_ATTEMPTS[username] >= 3:
-        print("Error: Account is temporarily locked due to too many failed attempts.")
-        print("Please try again later or contact administrator.")
-        return None
-
     password = getpass.getpass("Enter password: ").strip()
     data = {"username": username, "password": password}
-    
+
     try:
         response = session.post(f"{SERVER_URL}/login", json=data)
         resp = response.json()
-        
+
         if response.status_code == 200:
             print(resp.get("message"))
             SESSION_USERNAME = username
-            # Reset attempts on successful login
-            LOGIN_ATTEMPTS[username] = 0
             return username
         else:
-            # Increment failed attempts
-            LOGIN_ATTEMPTS[username] += 1
-            remaining_attempts = 3 - LOGIN_ATTEMPTS[username]
-            
-            if remaining_attempts > 0:
-                print(f"Error: {resp.get('error')}")
-                print(f"Remaining attempts: {remaining_attempts}")
-            else:
-                print("Account has been locked due to too many failed attempts.")
-                print("Please try again later or contact administrator.")
-            return None
-            
+            print("Error:", resp.get("error"))
+
     except Exception as e:
         print("Connection error:", e)
         return None
@@ -403,9 +381,10 @@ def download_file(session):
 def reset_password_logged_in(session):
     print("\n--- Reset Password ---")
     old_password = getpass.getpass("Enter current password: ").strip()
-    
+
     while True:
-        new_password = getpass.getpass("Enter new password (min 10 characters): ").strip()
+        new_password = getpass.getpass(
+            "Enter new password (min 10 characters): ").strip()
         is_valid, error_msg = validate_password(new_password)
         if not is_valid:
             print(f"Invalid password: {error_msg}")
@@ -628,7 +607,9 @@ def view_logs(session):
             logs = response.json().get("logs", [])
             for log in logs:
                 print(
-                    f"{log['timestamp']} - {log['username']} - {log['operation']} - {log['details']} (Hash: {log['log_hash']})")
+                    f"{log['timestamp']} - {log['username']} - {log['operation']} - {log['details']}")
+                # print(
+                #     f"{log['timestamp']} - {log['username']} - {log['operation']} - {log['details']} (Hash: {log['log_hash']})")
         else:
             print("Error:", response.json().get("error"))
     except Exception as e:
@@ -638,6 +619,8 @@ def view_logs(session):
 def main():
     # Using a persistent requests.Session to store cookies.
     session = requests.Session()
+    # only for development
+    session.verify = "cert.pem"
     while True:
         if not SESSION_USERNAME:
             print_menu_logged_out()

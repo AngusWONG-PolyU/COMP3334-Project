@@ -7,6 +7,7 @@ import hmac
 import time
 from functools import wraps
 import base64
+import datetime
 
 app = Flask(__name__)
 DATABASE = 'database.db'
@@ -32,7 +33,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            public_key TEXT
+            public_key TEXT,
+            failed_attempts INTEGER DEFAULT 0,
+            lockout_time DATETIME
         );
     ''')
 
@@ -226,6 +229,9 @@ def register():
 
     if not username or not password or not public_key:
         return jsonify({'error': 'Username, password, and public key are required'}), 400
+    # TODO: Change back to 10
+    if len(password) < 1:
+        return jsonify({'error': 'Password must be at least 10 characters long'}), 400
 
     hashed_password = hash_password(password)
     try:
@@ -248,18 +254,64 @@ def login():
     password = data.get('password')
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
+
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('SELECT * FROM users WHERE username = ?', (username,))
+    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
     user = cur.fetchone()
-    conn.close()
-    if user is None or not verify_password(user['password'], password):
+    if not user:
+        conn.close()
         return jsonify({'error': 'Invalid username or password'}), 401
+
+    # Check if account is currently locked.
+    lockout_time = user['lockout_time']
+    if lockout_time:
+        # SQLite returns DATETIME as a string, e.g. "2023-03-15 12:34:56"
+        current_time = datetime.datetime.now()
+        lockout_time_dt = datetime.datetime.strptime(
+            lockout_time, "%Y-%m-%d %H:%M:%S")
+        if current_time < lockout_time_dt:
+            remaining = (lockout_time_dt - current_time).seconds
+            conn.close()
+            return jsonify({'error': f"Account locked. Try again after {remaining} seconds."}), 403
+
+    # Check password.
+    if not verify_password(user['password'], password):
+        log_operation(username, "login fail",
+                      f"User {username} logged in fail. From {request.remote_addr}")
+        failed_attempts = user['failed_attempts'] if user['failed_attempts'] is not None else 0
+        failed_attempts += 1
+        # If maximum attempts reached, lock account for 5 minutes. (30 seconds for demo)
+        if failed_attempts >= 3:
+            # lockout_period = datetime.timedelta(minutes=5)
+            lockout_period = datetime.timedelta(seconds=30)
+            new_lockout_time = datetime.datetime.now() + lockout_period
+            new_lockout_time_str = new_lockout_time.strftime(
+                "%Y-%m-%d %H:%M:%S")
+            cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = ? WHERE username = ?",
+                        (new_lockout_time_str, username))
+            conn.commit()
+            conn.close()
+            return jsonify({'error': "Too many failed login attempts. Account locked for 30 seconds."}), 403
+        else:
+            cur.execute("UPDATE users SET failed_attempts = ? WHERE username = ?",
+                        (failed_attempts, username))
+            conn.commit()
+            conn.close()
+            return jsonify({'error': "Invalid username or password."}), 401
+
+    # Successful login: reset failed_attempts and lockout_time.
+    cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = NULL WHERE username = ?",
+                (username,))
+    conn.commit()
+    conn.close()
+
     cookie = generate_session_cookie(username)
     response = make_response(jsonify({'message': 'Logged in successfully'}))
     response.set_cookie('session', cookie, httponly=True, samesite='Strict')
+
     log_operation(username, "login",
-                  f"User {username} logged in.")
+                  f"User {username} logged in. From {request.remote_addr}")
     return response
 
 
@@ -273,6 +325,10 @@ def reset_password():
 
     if not username or not old_password or not new_password:
         return jsonify({'error': 'Username, old password, and new password are required'}), 400
+
+    # TODO: Change back to 10
+    if len(new_password) < 1:
+        return jsonify({'error': 'Password must be at least 10 characters long'}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -559,4 +615,4 @@ def get_logs():
 
 if __name__ == '__main__':
     init_db()  # initialize the database and tables if they don't exist
-    app.run(debug=True)
+    app.run(host="127.0.0.1", ssl_context=("cert.pem", "key.pem"), debug=True)
