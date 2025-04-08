@@ -286,8 +286,12 @@ def login():
             conn.close()
             return jsonify({'error': f"Account locked. Try again after {remaining} seconds."}), 403
 
-    # Check password.
-    if not verify_password(user['password'], password):
+    # Verify the OTP using the stored OTP secret.
+    otp_secret = user['otp_secret']
+    totp = pyotp.TOTP(otp_secret)
+    # Check password and OTP.
+    # Allow an extra window of 1 step (30 seconds) so that the OTP from the previous tick is also accepted.
+    if not verify_password(user['password'], password) or not totp.verify(otp_input, valid_window=1):
         log_operation(username, "login fail",
                       f"User {username} logged in fail. From {request.remote_addr}")
         failed_attempts = user['failed_attempts'] if user['failed_attempts'] is not None else 0
@@ -309,17 +313,7 @@ def login():
                         (failed_attempts, username))
             conn.commit()
             conn.close()
-            return jsonify({'error': "Invalid username or password."}), 401
-
-    # Verify the OTP using the stored OTP secret.
-    otp_secret = user['otp_secret']
-    totp = pyotp.TOTP(otp_secret)
-    # Allow an extra window of 1 step (30 seconds) so that the OTP from the previous tick is also accepted.
-    if not totp.verify(otp_input, valid_window=1):
-        log_operation(username, "login fail",
-                      f"User {username} logged in fail. From {request.remote_addr}")
-        conn.close()
-        return jsonify({'error': 'Invalid OTP'}), 401
+            return jsonify({'error': "Invalid username or password or OTP."}), 401
 
     # Successful login: reset failed_attempts and lockout_time.
     cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = NULL WHERE username = ?",
