@@ -8,6 +8,7 @@ import time
 from functools import wraps
 import base64
 import datetime
+import pyotp
 
 app = Flask(__name__)
 DATABASE = 'database.db'
@@ -34,6 +35,7 @@ def init_db():
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             public_key TEXT,
+            otp_secret TEXT NOT NULL,  -- store the OTP key
             failed_attempts INTEGER DEFAULT 0,
             lockout_time DATETIME
         );
@@ -71,8 +73,8 @@ def init_db():
         admin_password = "admin"
         hashed_admin_password = hash_password(admin_password)
         # Insert admin user with public_key set to NULL.
-        cur.execute("INSERT INTO users (username, password, public_key) VALUES (?, ?, ?)",
-                    (admin_username, hashed_admin_password, None))
+        cur.execute("INSERT INTO users (username, password, public_key,otp_secret) VALUES (?, ?, ?,?)",
+                    (admin_username, hashed_admin_password, None, admin_password))
 
     conn.commit()
     conn.close()
@@ -226,19 +228,27 @@ def register():
     username = data.get('username')
     password = data.get('password')
     public_key = data.get('public_key')  # New field: user's RSA public key
+    otp_secret = data.get('otp_secret')  # OTP secret provided by the user
 
-    if not username or not password or not public_key:
-        return jsonify({'error': 'Username, password, and public key are required'}), 400
+    if not username or not password or not public_key or not otp_secret:
+        return jsonify({'error': 'Username, password, public key, and OTP secret are required'}), 400
+
     # TODO: Change back to 10
     if len(password) < 1:
         return jsonify({'error': 'Password must be at least 10 characters long'}), 400
+
+    try:
+        # The function will raise an exception if s is not valid base32.
+        base64.b32decode(otp_secret, casefold=True)
+    except Exception:
+        return jsonify({'error': 'Invalid OTP secret. It must be a valid base32 encoded string.'}), 400
 
     hashed_password = hash_password(password)
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('INSERT INTO users (username, password, public_key) VALUES (?, ?, ?)',
-                    (username, hashed_password, public_key))
+        cur.execute('INSERT INTO users (username, password, public_key, otp_secret) VALUES (?, ?, ?, ?)',
+                    (username, hashed_password, public_key, otp_secret))
         conn.commit()
         return jsonify({'message': 'User registered successfully'})
     except sqlite3.IntegrityError:
@@ -252,8 +262,9 @@ def login():
     data = request.get_json()
     username = data.get('username')
     password = data.get('password')
-    if not username or not password:
-        return jsonify({'error': 'Username and password required'}), 400
+    otp_input = data.get('otp')  # one-time password from the client
+    if not username or not password or not otp_input:
+        return jsonify({'error': 'Username, password, and OTP required'}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -299,6 +310,16 @@ def login():
             conn.commit()
             conn.close()
             return jsonify({'error': "Invalid username or password."}), 401
+
+    # Verify the OTP using the stored OTP secret.
+    otp_secret = user['otp_secret']
+    totp = pyotp.TOTP(otp_secret)
+    # Allow an extra window of 1 step (30 seconds) so that the OTP from the previous tick is also accepted.
+    if not totp.verify(otp_input, valid_window=1):
+        log_operation(username, "login fail",
+                      f"User {username} logged in fail. From {request.remote_addr}")
+        conn.close()
+        return jsonify({'error': 'Invalid OTP'}), 401
 
     # Successful login: reset failed_attempts and lockout_time.
     cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = NULL WHERE username = ?",

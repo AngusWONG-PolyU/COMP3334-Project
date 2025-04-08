@@ -12,6 +12,19 @@ KEY_PASSWORD = None
 SESSION_USERNAME = None
 
 
+def is_valid_base32(s):
+    """
+    Checks if the string s is a valid base32 encoded value.
+    The function attempts to decode s using base64.b32decode (case-insensitive).
+    """
+    try:
+        # The function will raise an exception if s is not valid base32.
+        base64.b32decode(s, casefold=True)
+        return True
+    except Exception:
+        return False
+
+
 def generate_rsa_keys(username, key_password):
     """
     Generate an RSA key pair for the given username.
@@ -188,6 +201,15 @@ def register():
             continue
         break
 
+    # Get and validate otp seceret
+    while True:
+        otp_secret = getpass.getpass(
+            "Enter your OTP secret (in base32): ").strip()
+        if not is_valid_base32(otp_secret):
+            print("Invalid OTP secret. It must be a valid base32 encoded string.")
+            continue
+        break
+
     # Generate RSA key pair using the separate key password.
     generate_rsa_keys(username, key_pass)
     # Load the public key from local file.
@@ -201,7 +223,7 @@ def register():
     ).decode('utf-8')
 
     data = {"username": username, "password": login_pass,
-            "public_key": public_key_pem}
+            "public_key": public_key_pem, "otp_secret": otp_secret}
     try:
         response = requests.post(
             f"{SERVER_URL}/register", json=data, verify="cert.pem")
@@ -219,7 +241,8 @@ def login(session):
     print("\n--- Login ---")
     username = input("Enter username: ").strip()
     password = getpass.getpass("Enter password: ").strip()
-    data = {"username": username, "password": password}
+    otp_input = input("Enter OTP code: ").strip()
+    data = {"username": username, "password": password, "otp": otp_input}
 
     try:
         response = session.post(f"{SERVER_URL}/login", json=data)
