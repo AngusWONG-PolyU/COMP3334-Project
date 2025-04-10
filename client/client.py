@@ -160,6 +160,12 @@ def validate_password(password):
 def register():
     print("\n--- Register ---")
     username = input("Enter username: ").strip()
+
+    # Check if the username only contains letters and numbers.
+    if not username.isalnum():
+        print("Error: Username can only contain letters and numbers.")
+        return
+
     # Check if username already exists
     try:
         response = requests.get(
