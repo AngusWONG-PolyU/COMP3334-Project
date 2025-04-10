@@ -166,6 +166,13 @@ def is_valid_username(username):
     return True
 
 
+def is_valid_username(username):
+    for char in username:
+        if not (char.isalnum() or char == '_'):
+            return False
+    return True
+
+
 def register():
     print("\n--- Register ---")
     while True:
@@ -176,7 +183,6 @@ def register():
                 return
             break
         print("Invalid username. Please try again.")
-
     # Check if username already exists
     try:
         response = requests.get(
@@ -256,7 +262,14 @@ def login(session):
     """
     global SESSION_USERNAME
     print("\n--- Login ---")
-    username = input("Enter username: ").strip()
+    while True:
+        username = input(
+            'Enter username (only letters, numbers, and underscores) (Type "exit" to exit): ').strip()
+        if is_valid_username(username) or username == "exit":
+            if username == "exit":
+                return
+            break
+        print("Invalid username. Please try again.")
     password = getpass.getpass("Enter password: ").strip()
     otp_input = input("Enter OTP code: ").strip()
     data = {"username": username, "password": password, "otp": otp_input}

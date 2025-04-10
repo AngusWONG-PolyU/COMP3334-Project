@@ -85,7 +85,7 @@ def init_db():
         admin_password = "admin"
         hashed_admin_password = hash_password(admin_password)
         # Insert admin user with public_key set to NULL.
-        cur.execute("INSERT INTO users (username, password, public_key,otp_secret) VALUES (?, ?, ?,?)",
+        cur.execute("INSERT INTO users (username, password, public_key,otp_secret) VALUES (?, ?, ?, ?)",
                     (admin_username, hashed_admin_password, None, admin_password))
 
     conn.commit()
@@ -244,9 +244,6 @@ def register():
 
     if not username or not password or not public_key or not otp_secret:
         return jsonify({'error': 'Username, password, public key, and OTP secret are required'}), 400
-
-    if not username.isalnum():
-        return jsonify({'error': 'Username can only contain letters and numbers.'}), 400
 
     # TODO: Change back to 10
     if len(password) < 1:
