@@ -166,13 +166,6 @@ def is_valid_username(username):
     return True
 
 
-def is_valid_username(username):
-    for char in username:
-        if not (char.isalnum() or char == '_'):
-            return False
-    return True
-
-
 def register():
     print("\n--- Register ---")
     while True:

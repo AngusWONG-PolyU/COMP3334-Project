@@ -234,6 +234,13 @@ def check_username():
     return jsonify({'exists': exists})
 
 
+def is_valid_username(username):
+    for char in username:
+        if not (char.isalnum() or char == '_'):
+            return False
+    return True
+
+
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -245,6 +252,8 @@ def register():
     if not username or not password or not public_key or not otp_secret:
         return jsonify({'error': 'Username, password, public key, and OTP secret are required'}), 400
 
+    if is_valid_username(username):
+        return jsonify({'error': 'Username can only contain letters, numbers and underscores'}), 400
     # TODO: Change back to 10
     if len(password) < 1:
         return jsonify({'error': 'Password must be at least 10 characters long'}), 400
