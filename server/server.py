@@ -7,7 +7,7 @@ import hmac
 import time
 from functools import wraps
 import base64
-import datetime
+from datetime import datetime, timedelta
 import pyotp
 
 app = Flask(__name__)
@@ -49,7 +49,19 @@ def init_db():
             filename TEXT NOT NULL,
             enc_aes_key TEXT NOT NULL,
             file_data BLOB NOT NULL,
-            shared_by TEXT DEFAULT NULL
+            sent_by TEXT DEFAULT NULL
+        );
+    ''')
+
+    # Create the file_shares table to store sharing info.
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS file_shares (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            target_username TEXT NOT NULL,
+            encrypted_aes_key TEXT NOT NULL,
+            shared_by TEXT NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files(id)
         );
     ''')
 
@@ -419,7 +431,7 @@ def list_files():
     cur = conn.cursor()
     # Retrieve all files where the logged-in user is the owner.
     cur.execute(
-        'SELECT id, filename, shared_by FROM files WHERE owner = ?', (request.username,))
+        'SELECT id, filename, sent_by FROM files WHERE owner = ?', (request.username,))
     files = cur.fetchall()
     conn.close()
 
@@ -429,12 +441,101 @@ def list_files():
             "id": f["id"],
             "filename": f["filename"]
         }
-        # Only include the "shared_by" field if it is not empty or NULL.
-        if f["shared_by"]:
-            file_dict["shared_by"] = f["shared_by"]
+        # Only include the "sent_by" field if it is not empty or NULL.
+        if f["sent_by"]:
+            file_dict["sent_by"] = f["sent_by"]
         file_list.append(file_dict)
 
     return jsonify({"files": file_list})
+
+
+@app.route('/list_all_files', methods=['GET'])
+@require_login
+def list_all_files():
+    """
+    List all files that the current user either owns or have been shared with the user.
+    Files that the user owns come from the 'files' table (where owner equals the logged-in user).
+    Files shared with the user are retrieved by joining the 'files' table with 'file_shares'
+    where target_username matches the logged-in user.
+    The response is a JSON containing a list of files, where each file includes:
+      - id
+      - filename
+      - shared_by (if the file was shared; otherwise, it is omitted or null)
+    """
+    username = request.username
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Query for files that the user owns.
+    cur.execute(
+        "SELECT id, filename, sent_by FROM files WHERE owner = ?", (username,))
+    owned_files = cur.fetchall()
+
+    # Query for files that have been shared with the user. We join file_shares to get
+    # who shared the file.
+    cur.execute("""
+        SELECT f.id, f.filename, fs.shared_by
+        FROM files f 
+        JOIN file_shares fs ON f.id = fs.file_id 
+        WHERE fs.target_username = ?
+    """, (username,))
+    shared_files = cur.fetchall()
+
+    # Combine the two result sets.
+    all_files = []
+    for row in owned_files:
+        file_entry = {
+            "id": row["id"],
+            "filename": row["filename"],
+            "sent_by": row["sent_by"]
+        }
+        all_files.append(file_entry)
+
+    for row in shared_files:
+        file_entry = {
+            "id": row["id"],
+            "filename": row["filename"],
+            "shared_by": row["shared_by"]
+        }
+        all_files.append(file_entry)
+
+    conn.close()
+    return jsonify({"files": all_files})
+
+
+@app.route('/list_shared_users', methods=['GET'])
+@require_login
+def list_shared_users():
+    file_id = request.args.get("file_id")
+    if not file_id:
+        return jsonify({'error': 'Missing file_id parameter'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Verify that the file exists and that the logged-in user is the owner.
+    cur.execute("SELECT * FROM files WHERE id = ? AND owner = ?",
+                (file_id, request.username))
+    file_record = cur.fetchone()
+    if not file_record:
+        conn.close()
+        return jsonify({'error': 'File not found or access denied'}), 404
+
+    # Retrieve all shares for the given file.
+    cur.execute(
+        "SELECT target_username FROM file_shares WHERE file_id = ?", (file_id,))
+    share_records = cur.fetchall()
+    conn.close()
+
+    # Build a list of dictionaries containing the shared user information.
+    shared_users = []
+    for record in share_records:
+        shared_users.append({
+            "target_username": record["target_username"],
+        })
+
+    return jsonify({"shared_users": shared_users})
 
 
 @app.route('/download_file', methods=['POST'])
@@ -447,20 +548,43 @@ def download_file():
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('SELECT * FROM files WHERE id = ? AND owner = ?',
+
+    # First, check if the user owns the file.
+    cur.execute("SELECT * FROM files WHERE id = ? AND owner = ?",
                 (file_id, request.username))
     file_record = cur.fetchone()
+
+    encrypted_aes_key = None
+
+    if file_record:
+        # User is the owner, use the AES key in the files table.
+        encrypted_aes_key = file_record['enc_aes_key']
+    else:
+        # Check if the file was shared with the user.
+        cur.execute("""
+            SELECT f.*, fs.encrypted_aes_key
+            FROM files f
+            JOIN file_shares fs ON f.id = fs.file_id
+            WHERE f.id = ? AND fs.target_username = ?
+        """, (file_id, request.username))
+        shared_record = cur.fetchone()
+        if shared_record:
+            file_record = shared_record
+            # Use the AES key stored in the share record.
+            encrypted_aes_key = shared_record['encrypted_aes_key']
+        else:
+            conn.close()
+            return jsonify({'error': 'File not found or access denied'}), 404
+
     conn.close()
 
-    if not file_record:
-        return jsonify({'error': 'File not found'}), 404
-
-    # Encode the binary file data for transport.
+    # Base64 encode the file data for transport.
     file_content_b64 = base64.b64encode(
         file_record['file_data']).decode('utf-8')
+
     return jsonify({
         'filename': file_record['filename'],
-        'enc_aes_key': file_record['enc_aes_key'],
+        'enc_aes_key': encrypted_aes_key,
         'file_content': file_content_b64
     })
 
@@ -536,9 +660,106 @@ def edit_file():
 @require_login
 def share_file():
     """
-    Allows a user to share one of their files with a designated user.
+    Allows the owner to share a file with another user.
     Expects form fields:
-      - original_file_id: The ID of the file being shared.
+      - file_id: The ID of the file being shared.
+      - target_username: The recipient's username.
+      - enc_aes_key: The new AES key encrypted with the recipient's public key.
+    The endpoint prevents duplicate sharing of the same file to the same user.
+    """
+    data = request.form
+    file_id = data.get('file_id')
+    target_username = data.get('target_username')
+    enc_aes_key = data.get('enc_aes_key')
+
+    if not file_id or not target_username or not enc_aes_key:
+        return jsonify({'error': 'Missing parameters'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Verify that the file exists and is owned by the current user.
+    cur.execute("SELECT * FROM files WHERE id = ? AND owner = ?",
+                (file_id, request.username))
+    file_record = cur.fetchone()
+    if not file_record:
+        conn.close()
+        return jsonify({'error': 'File not found or access denied'}), 404
+
+    # Check if the file has already been shared with the target user.
+    cur.execute("SELECT * FROM file_shares WHERE file_id = ? AND target_username = ?",
+                (file_id, target_username))
+    if cur.fetchone() is not None:
+        conn.close()
+        return jsonify({'error': 'This file has already been shared with that user.'}), 400
+
+    # Insert a new sharing record into the file_shares table.
+    cur.execute('''
+        INSERT INTO file_shares (file_id, target_username, encrypted_aes_key, shared_by)
+        VALUES (?, ?, ?, ?)
+    ''', (file_id, target_username, enc_aes_key, request.username))
+    conn.commit()
+    conn.close()
+
+    log_operation(request.username, "share",
+                  f"Shared file id {file_id} with {target_username}.")
+    return jsonify({'message': f'File shared successfully with {target_username}'})
+
+
+@app.route('/unshare_file', methods=['POST'])
+@require_login
+def unshare_file():
+    """
+    Allows a file owner to stop sharing a file with a designated recipient.
+    Expects JSON (or form) parameters:
+      - file_id: the ID of the file to unshare.
+      - target_username: the recipient from whom to revoke access.
+
+    The endpoint verifies that there is an existing share record where the
+    file is shared by the logged-in user to the specified target user,
+    and then deletes that record.
+    """
+    data = request.get_json()  # or use request.form if using form data
+    file_id = data.get('file_id')
+    target_username = data.get('target_username')
+
+    if not file_id or not target_username:
+        return jsonify({'error': 'Missing file_id or target_username'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Check whether a share record exists for this file, target, and that the current user shared it.
+    cur.execute("""
+        SELECT id 
+        FROM file_shares 
+        WHERE file_id = ? AND target_username = ? AND shared_by = ?
+    """, (file_id, target_username, request.username))
+    record = cur.fetchone()
+    if not record:
+        conn.close()
+        return jsonify({'error': 'No sharing record found for this file and target user, or you are not allowed to unshare.'}), 404
+
+    # Delete the share record.
+    cur.execute("""
+        DELETE FROM file_shares 
+        WHERE file_id = ? AND target_username = ? AND shared_by = ?
+    """, (file_id, target_username, request.username))
+    conn.commit()
+    conn.close()
+
+    log_operation(request.username, "unshare",
+                  f"Unshared file id {file_id} from {target_username}.")
+    return jsonify({'message': f'File unshared successfully from {target_username}.'})
+
+
+@app.route('/send_file', methods=['POST'])
+@require_login
+def send_file():
+    """
+    Allows a user to send one of their files with a designated user.
+    Expects form fields:
+      - original_file_id: The ID of the file being sent.
       - target_username: The recipient's username.
       - filename: The file name.
       - enc_aes_key: The new encrypted AES key (base64 encoded) for the recipient.
@@ -566,14 +787,14 @@ def share_file():
 
     # Read the re-encrypted file data.
     new_file_data = shared_file.read()
-    # Insert a new record for the shared file.
-    cur.execute('INSERT INTO files (owner, filename, enc_aes_key, file_data, shared_by) VALUES (?, ?, ?, ?, ?)',
+    # Insert a new record for the sent file.
+    cur.execute('INSERT INTO files (owner, filename, enc_aes_key, file_data, sent_by) VALUES (?, ?, ?, ?, ?)',
                 (target_username, filename, enc_aes_key, new_file_data, request.username))
     conn.commit()
     conn.close()
-    log_operation(request.username, "share",
-                  f"Shared file id {original_file_id} with {target_username}.")
-    return jsonify({'message': f'File shared successfully with {target_username}'})
+    log_operation(request.username, "send",
+                  f"Send file id {original_file_id}to {target_username}.")
+    return jsonify({'message': f'File send successfully to {target_username}'})
 
 
 @app.route('/delete_file', methods=['POST'])
@@ -586,6 +807,7 @@ def delete_file():
 
     conn = get_db_connection()
     cur = conn.cursor()
+
     # Check if the file exists and belongs to the current user.
     cur.execute("SELECT * FROM files WHERE id = ? AND owner = ?",
                 (file_id, request.username))
@@ -594,14 +816,18 @@ def delete_file():
         conn.close()
         return jsonify({'error': 'File not found or access denied'}), 404
 
-    # Delete the file record.
+    # Delete any share records associated with the file so shared users cannot download it.
+    cur.execute("DELETE FROM file_shares WHERE file_id = ?", (file_id,))
+
+    # Delete the file record from the files table.
     cur.execute("DELETE FROM files WHERE id = ? AND owner = ?",
                 (file_id, request.username))
     conn.commit()
     conn.close()
+
     log_operation(request.username, "delete",
                   f"Deleted file with id {file_id}.")
-    return jsonify({'message': 'File deleted successfully'})
+    return jsonify({'message': 'File and related share records deleted successfully'})
 
 
 @app.route('/get_logs', methods=['GET'])
@@ -620,9 +846,13 @@ def get_logs():
     # Convert log rows to a list of dictionaries.
     log_list = []
     for row in logs:
+        # Adjust the timestamp to UTC+8
+        original_timestamp = datetime.strptime(
+            row["timestamp"], "%Y-%m-%d %H:%M:%S")
+        adjusted_timestamp = original_timestamp + timedelta(hours=8)
         log_list.append({
             "id": row["id"],
-            "timestamp": row["timestamp"],
+            "timestamp": adjusted_timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "username": row["username"],
             "operation": row["operation"],
             "details": row["details"],

@@ -141,9 +141,11 @@ def print_menu_logged_in():
     print("3. Download File")
     print("4. Edit File")
     print("5. Share File")
-    print("6. Delete File")
-    print("7. Reset Password")
-    print("8. Logout")
+    print("6. Unshare File")
+    print("7. Send File")
+    print("8. Delete File")
+    print("9. Reset Password")
+    print("10. Logout")
 
 
 def validate_password(password):
@@ -157,14 +159,23 @@ def validate_password(password):
     return True, ""
 
 
+def is_valid_username(username):
+    for char in username:
+        if not (char.isalnum() or char == '_'):
+            return False
+    return True
+
+
 def register():
     print("\n--- Register ---")
-    username = input("Enter username: ").strip()
-
-    # Check if the username only contains letters and numbers.
-    if not username.isalnum():
-        print("Error: Username can only contain letters and numbers.")
-        return
+    while True:
+        username = input(
+            'Enter username (only letters, numbers, and underscores) (Type "exit" to exit): ').strip()
+        if is_valid_username(username) or username == "exit":
+            if username == "exit":
+                return
+            break
+        print("Invalid username. Please try again.")
 
     # Check if username already exists
     try:
@@ -337,13 +348,79 @@ def list_files(session):
             else:
                 print("\nYour files:")
                 for f in files:
-                    # If the 'shared_by' field exists and is non-empty, display it.
-                    if "shared_by" in f and f["shared_by"]:
+                    # If the 'sent_by' field exists and is non-empty, display it.
+                    if "sent_by" in f and f["sent_by"]:
                         print(
-                            f"ID: {f['id']}, Filename: {f['filename']} (Shared by: {f['shared_by']})")
+                            f"ID: {f['id']}, Filename: {f['filename']} (Sent by: {f['sent_by']})")
                     else:
                         print(f"ID: {f['id']}, Filename: {f['filename']}")
             return files
+        else:
+            print("Error:", response.json().get("error"))
+            return []
+    except Exception as e:
+        print("Connection error:", e)
+        return []
+
+
+def list_all_files(session):
+    """
+    Retrieves and displays all files that the logged-in user either owns or have been shared with.
+    For each file, if it has been shared, the 'shared_by' field will be displayed.
+    """
+    try:
+        response = session.get(
+            f"{SERVER_URL}/list_all_files")
+        if response.status_code == 200:
+            files = response.json().get("files", [])
+            if not files:
+                print("No files found.")
+            else:
+                print("\nFiles available to you:")
+                for f in files:
+                    # For shared files, display who shared it.
+                    if "sent_by" in f and f["sent_by"]:
+                        print(
+                            f"ID: {f['id']}, Filename: {f['filename']} (Sent by: {f['sent_by']})")
+                    elif "shared_by" in f and f["shared_by"]:
+                        print(
+                            f"ID: {f['id']}, Filename: {f['filename']} (Shared by: {f['shared_by']})")
+                    else:
+                        print(
+                            f"ID: {f['id']}, Filename: {f['filename']}")
+            return files
+        else:
+            print("Error:", response.json().get("error"))
+            return []
+    except Exception as e:
+        print("Connection error:", e)
+        return []
+
+
+def list_shared_users(session, file_id):
+    """
+    Lists the usernames with which a specified file has been shared.
+    Only the owner of the file can retrieve this list.
+    """
+    if not file_id:
+        print("File ID is required.")
+        return
+
+    try:
+        response = session.get(
+            f"{SERVER_URL}/list_shared_users?file_id={file_id}")
+        if response.status_code == 200:
+            data = response.json()
+            shared_users = data.get("shared_users", [])
+            if not shared_users:
+                print("This file has not been shared with any user.")
+            else:
+                print(
+                    f"\nThe file (ID: {file_id}) is shared with the following users:")
+                for user in shared_users:
+                    print(
+                        f" - {user['target_username']}")
+            return shared_users
         else:
             print("Error:", response.json().get("error"))
             return []
@@ -358,7 +435,7 @@ def download_file(session):
     Uses the cached password to load the RSA private key for decrypting the AES key.
     """
     print("\n--- Download File ---")
-    files = list_files(session)
+    files = list_all_files(session)
     if not files:
         return
     file_id = input("Enter the ID of the file to download: ").strip()
@@ -508,22 +585,129 @@ def edit_file(session):
 
 def share_file(session):
     """
-    Shares one of the current user's files with a designated recipient.
+    Share a file with another user. The owner downloads their file's AES key,
+    retrieves the target user's public key from the server, and re-encrypts the AES key.
+    The resulting encrypted key is sent to the server to be stored in the file_shares table.
+    """
+    print("\n--- Share File ---")
+    files = list_files(session)  # Lists files owned by the current user.
+    if not files:
+        return
+
+    file_id = input("Enter the ID of the file you want to share: ").strip()
+    target_username = input("Enter the username to share with: ").strip()
+
+    # Step 1: Download the file to obtain the encrypted AES key.
+    try:
+        data = {"file_id": file_id}
+        response = session.post(f"{SERVER_URL}/download_file", json=data)
+        if response.status_code != 200:
+            print("Error:", response.json().get("error"))
+            return
+        resp = response.json()
+        enc_aes_key_b64 = resp.get("enc_aes_key")
+        if not enc_aes_key_b64:
+            print("Error: Missing AES key in download.")
+            return
+    except Exception as e:
+        print("Error during file retrieval:", e)
+        return
+
+    # Step 2: Decrypt the AES key using the owner's private RSA key.
+    try:
+        private_key = load_rsa_private_key()
+        if not private_key:
+            print("Unable to load private key. Aborting share.")
+            return
+        original_aes_key = private_key.decrypt(
+            base64.b64decode(enc_aes_key_b64),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+    except Exception as e:
+        print("Error during decryption:", e)
+        return
+
+    # Step 3: Retrieve the target user's public key.
+    target_public_key = get_public_key_from_server(session, target_username)
+    if target_public_key is None:
+        print("Failed to retrieve target user's public key.")
+        return
+
+    # Step 4: Re-encrypt the original AES key using the target user's public key.
+    try:
+        new_encrypted_aes_key = target_public_key.encrypt(
+            original_aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        new_enc_aes_key_b64 = base64.b64encode(
+            new_encrypted_aes_key).decode('utf-8')
+    except Exception as e:
+        print("Error during re-encryption:", e)
+        return
+
+    # Step 5: Submit the share request to the server.
+    try:
+        share_data = {
+            "file_id": file_id,
+            "target_username": target_username,
+            "enc_aes_key": new_enc_aes_key_b64
+        }
+        response = session.post(f"{SERVER_URL}/share_file", data=share_data)
+        print(response.json().get("message") or response.json().get("error"))
+    except Exception as e:
+        print("Connection error during file sharing:", e)
+
+
+def unshare_file(session):
+    print("\n--- Unshare File ---")
+    files = list_files(session)  # Lists files owned by the current user.
+    if not files:
+        return
+    file_id = input("Enter the ID of the file you want to unshare: ").strip()
+    share_users = list_shared_users(session, file_id)
+    if not share_users:
+        return
+    target_username = input("Enter the username to unshare from: ").strip()
+    if not file_id or not target_username:
+        print("File ID and target username are required.")
+        return
+    try:
+        data = {"file_id": file_id, "target_username": target_username}
+        response = session.post(f"{SERVER_URL}/unshare_file", json=data)
+        if response.status_code == 200:
+            print(response.json().get("message"))
+        else:
+            print("Error:", response.json().get("error"))
+    except Exception as e:
+        print("Connection error:", e)
+
+
+def send_file(session):
+    """
+    Send one of the current user's files with a designated recipient.
     The function:
-      1. Lists the current user's files and prompts for a file ID to share.
+      1. Lists the current user's files and prompts for a file ID to send.
       2. Prompts for the target username.
       3. Downloads and decrypts the chosen file.
       4. Re-encrypts the file with a new AES key.
       5. Encrypts the new AES key with the target user's public key.
-      6. Uploads the re-encrypted file and the new encrypted key to the server via the /share_file endpoint.
+      6. Uploads the re-encrypted file and the new encrypted key to the server via the /send_file endpoint.
     """
-    print("\n--- Share File ---")
+    print("\n--- Send File ---")
     files = list_files(session)
     if not files:
         return
     original_file_id = input(
-        "Enter the ID of the file you want to share: ").strip()
-    target_username = input("Enter the username to share with: ").strip()
+        "Enter the ID of the file you want to send: ").strip()
+    target_username = input("Enter the username to send: ").strip()
     # Fetch the target user's public key from the server.
     target_public_key = get_public_key_from_server(
         session, target_username)
@@ -601,10 +785,10 @@ def share_file(session):
             "enc_aes_key": new_enc_aes_key_b64
         }
         response = session.post(
-            f"{SERVER_URL}/share_file", data=share_data, files=files_field)
+            f"{SERVER_URL}/send_file", data=share_data, files=files_field)
         print(response.json().get("message") or response.json().get("error"))
     except Exception as e:
-        print("Connection error during file sharing:", e)
+        print("Connection error during file sending:", e)
 
 
 def delete_file(session):
@@ -678,7 +862,7 @@ def main():
             if choice == '1':
                 upload_file(session)
             elif choice == '2':
-                list_files(session)
+                list_all_files(session)
             elif choice == '3':
                 download_file(session)
             elif choice == '4':
@@ -686,10 +870,14 @@ def main():
             elif choice == '5':
                 share_file(session)
             elif choice == '6':
-                delete_file(session)
+                unshare_file(session)
             elif choice == '7':
-                reset_password_logged_in(session)
+                send_file(session)
             elif choice == '8':
+                delete_file(session)
+            elif choice == '9':
+                reset_password_logged_in(session)
+            elif choice == '10':
                 logout(session)
             else:
                 print("Invalid choice. Try again.")
