@@ -385,7 +385,8 @@ def reset_password():
                 (new_hashed_password, username))
     conn.commit()
     conn.close()
-
+    log_operation(request.username, "reset password",
+                  f"User {request.username} reset password.")
     return jsonify({'message': 'Password reset successfully'})
 
 
