@@ -9,6 +9,8 @@ from functools import wraps
 import base64
 from datetime import datetime, timedelta
 import pyotp
+from datetime import datetime, timedelta
+
 
 app = Flask(__name__)
 DATABASE = 'database.db'
@@ -292,20 +294,26 @@ def login():
     cur.execute("SELECT * FROM users WHERE username = ?", (username,))
     user = cur.fetchone()
     if not user:
-        conn.close()
+        conn.close() # Close connection before returning
         return jsonify({'error': 'Invalid username or password'}), 401
 
     # Check if account is currently locked.
     lockout_time = user['lockout_time']
     if lockout_time:
         # SQLite returns DATETIME as a string, e.g. "2023-03-15 12:34:56"
-        current_time = datetime.datetime.now()
-        lockout_time_dt = datetime.datetime.strptime(
-            lockout_time, "%Y-%m-%d %H:%M:%S")
+        # Ensure datetime comparison is being imported correctly if needed at the top
+        # import datetime # Make sure this is present if not already
+        current_time = datetime.now()
+        lockout_time_dt = datetime.strptime(lockout_time, "%Y-%m-%d %H:%M:%S")
         if current_time < lockout_time_dt:
             remaining = (lockout_time_dt - current_time).seconds
-            conn.close()
+            conn.close() # Close connection before returning
             return jsonify({'error': f"Account locked. Try again after {remaining} seconds."}), 403
+        else:
+            # Lockout expired, reset it before proceeding
+            cur.execute("UPDATE users SET lockout_time = NULL WHERE username = ?", (username,))
+            conn.commit()
+            # Keep connection open as we proceed to check credentials
 
     # Verify the OTP using the stored OTP secret.
     otp_secret = user['otp_secret']
@@ -315,32 +323,38 @@ def login():
     if not verify_password(user['password'], password) or not totp.verify(otp_input, valid_window=1):
         log_operation(username, "login fail",
                       f"User {username} logged in fail. From {request.remote_addr}")
-        failed_attempts = user['failed_attempts'] if user['failed_attempts'] is not None else 0
+        # Need to re-fetch failed_attempts as lockout might have been reset above
+        cur.execute("SELECT failed_attempts FROM users WHERE username = ?", (username,))
+        current_failed_attempts = cur.fetchone()['failed_attempts']
+        failed_attempts = current_failed_attempts if current_failed_attempts is not None else 0
         failed_attempts += 1
-        # If maximum attempts reached, lock account for 5 minutes. (30 seconds for demo)
+
+        # If maximum attempts reached, lock account for 30 seconds.
         if failed_attempts >= 3:
-            # lockout_period = datetime.timedelta(minutes=5)
-            lockout_period = datetime.timedelta(seconds=30)
-            new_lockout_time = datetime.datetime.now() + lockout_period
-            new_lockout_time_str = new_lockout_time.strftime(
-                "%Y-%m-%d %H:%M:%S")
+            lockout_period = timedelta(seconds=30) # Use timedelta directly
+            new_lockout_time = datetime.now() + lockout_period
+            new_lockout_time_str = new_lockout_time.strftime("%Y-%m-%d %H:%M:%S")
             cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = ? WHERE username = ?",
                         (new_lockout_time_str, username))
             conn.commit()
-            conn.close()
+            conn.close() # Close connection before returning
+            # *** This is the message that should now be returned correctly ***
             return jsonify({'error': "Too many failed login attempts. Account locked for 30 seconds."}), 403
         else:
+            # Increment failed attempts, keep lockout_time as NULL (or as it was if expired)
             cur.execute("UPDATE users SET failed_attempts = ? WHERE username = ?",
                         (failed_attempts, username))
             conn.commit()
-            conn.close()
+            conn.close() # Close connection before returning
             return jsonify({'error': "Invalid username or password or OTP."}), 401
 
-    # Successful login: reset failed_attempts and lockout_time.
+    # Successful login: reset failed_attempts and lockout_time (if somehow set by expired lockout).
     cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = NULL WHERE username = ?",
                 (username,))
     conn.commit()
-    conn.close()
+    # Do NOT close connection here yet, need it for cookie generation if that involved DB (it doesn't, but cleaner flow)
+
+    conn.close() # Close connection AFTER successful DB updates and before generating response
 
     cookie = generate_session_cookie(username)
     response = make_response(jsonify({'message': 'Logged in successfully'}))
@@ -349,7 +363,6 @@ def login():
     log_operation(username, "login",
                   f"User {username} logged in. From {request.remote_addr}")
     return response
-
 
 @app.route('/reset_password', methods=['POST'])
 @require_login
