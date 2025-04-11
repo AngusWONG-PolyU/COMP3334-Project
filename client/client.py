@@ -521,7 +521,7 @@ def edit_file(session):
 
     # Ask the user if they want to update the filename.
     new_filename = input(
-        "Enter new filename (leave empty to keep current): ").strip()
+        "Enter new filename with extension (leave empty to keep current): ").strip()
 
     # Ask whether to update file content.
     update_content = input(
