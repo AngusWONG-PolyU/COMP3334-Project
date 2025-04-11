@@ -252,7 +252,7 @@ def register():
     if not username or not password or not public_key or not otp_secret:
         return jsonify({'error': 'Username, password, public key, and OTP secret are required'}), 400
 
-    if is_valid_username(username):
+    if not is_valid_username(username):
         return jsonify({'error': 'Username can only contain letters, numbers and underscores'}), 400
     # TODO: Change back to 10
     if len(password) < 1:
