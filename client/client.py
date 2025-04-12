@@ -512,81 +512,93 @@ def reset_password_logged_in(session):
 
 
 def edit_file(session):
+    """
+    Edit an existing file. The owner can update the filename and/or the file content.
+    When updating the file content, the same AES key is used (i.e., it is not modified).
+    """
     print("\n--- Edit File ---")
-    # List files for the user.
+    # List files for the user
     files = list_files(session)
     if not files:
         return
     file_id = input("Enter the ID of the file you want to edit: ").strip()
 
-    # Ask the user if they want to update the filename.
+    # Ask if the user wants to update the filename.
     new_filename = input(
-        "Enter new filename with extension (leave empty to keep current): ").strip()
+        "Enter new filename (leave empty to keep current): ").strip()
 
-    # Ask whether to update file content.
+    # Ask if the user wants to update the file content.
     update_content = input(
         "Do you want to update the file content? (y/n): ").strip().lower()
 
-    update_fields = {}
+    update_data = {"file_id": file_id}
     if new_filename:
-        update_fields['filename'] = new_filename
-
-    if update_content == 'y':
-        file_path = input("Enter the path of the new file content: ").strip()
-        if not os.path.exists(file_path):
-            print("File does not exist.")
-            return
-        # Read new file data.
-        with open(file_path, "rb") as f:
-            file_data = f.read()
-        # Generate a random 256-bit AES key.
-        aes_key = AESGCM.generate_key(bit_length=256)
-        aesgcm = AESGCM(aes_key)
-        nonce = os.urandom(12)  # AES-GCM recommended nonce size
-        encrypted_file_data = aesgcm.encrypt(nonce, file_data, None)
-        # Prepend the nonce to the ciphertext.
-        encrypted_file = nonce + encrypted_file_data
-
-        # Encrypt the AES key with the public key from the server.
-        public_key = get_public_key_from_server(session)
-        if public_key is None:
-            return
-        encrypted_aes_key = public_key.encrypt(
-            aes_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        # Base64 encode the encrypted AES key.
-        enc_aes_key_b64 = base64.b64encode(encrypted_aes_key).decode('utf-8')
-        update_fields['enc_aes_key'] = enc_aes_key_b64
-        # Include the new file under the field name "file".
-        update_fields['file'] = (os.path.basename(file_path), encrypted_file)
-
-    if not new_filename and update_content != 'y':
-        print("No update provided.")
-        return
-
-    # Build the form data for the POST request.
-    data = {"file_id": file_id}
-    if 'filename' in update_fields:
-        data['filename'] = update_fields['filename']
-    if 'enc_aes_key' in update_fields:
-        data['enc_aes_key'] = update_fields['enc_aes_key']
+        update_data["filename"] = new_filename
 
     files_field = None
-    if 'file' in update_fields:
-        files_field = {"file": update_fields['file']}
+
+    if update_content == 'y':
+        # Step 1: Download the file's metadata to retrieve the existing encrypted AES key.
+        try:
+            data = {"file_id": file_id}
+            response = session.post(f"{SERVER_URL}/download_file", json=data)
+            if response.status_code != 200:
+                print("Error:", response.json().get("error"))
+                return
+            resp = response.json()
+            current_enc_aes_key = resp.get("enc_aes_key")
+            if not current_enc_aes_key:
+                print("Error: File does not contain an AES key.")
+                return
+        except Exception as e:
+            print("Error retrieving file info:", e)
+            return
+
+        # Step 2: Decrypt the current AES key using the owner's RSA private key.
+        try:
+            private_key = load_rsa_private_key()
+            if not private_key:
+                print("Unable to load private key. Aborting edit.")
+                return
+            original_aes_key = private_key.decrypt(
+                base64.b64decode(current_enc_aes_key),
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+        except Exception as e:
+            print("Error during AES key decryption:", e)
+            return
+
+        # Step 3: Read the new file content and encrypt it using the same AES key.
+        new_file_path = input(
+            "Enter the path of the new file content: ").strip()
+        if not os.path.exists(new_file_path):
+            print("File does not exist.")
+            return
+        try:
+            with open(new_file_path, "rb") as f:
+                new_file_data = f.read()
+            # Generate a new nonce (AES-GCM requires a new nonce for each encryption).
+            nonce = os.urandom(12)
+            aesgcm = AESGCM(original_aes_key)
+            new_encrypted_file = nonce + \
+                aesgcm.encrypt(nonce, new_file_data, None)
+            files_field = {"file": (os.path.basename(
+                new_file_path), new_encrypted_file)}
+        except Exception as e:
+            print("Error during file encryption:", e)
+            return
 
     try:
         response = session.post(
-            f"{SERVER_URL}/edit_file", data=data, files=files_field)
+            f"{SERVER_URL}/edit_file", data=update_data, files=files_field)
         resp = response.json()
         print(resp.get("message") or resp.get("error"))
     except Exception as e:
-        print("Connection error:", e)
+        print("Connection error during file edit:", e)
 
 
 def share_file(session):

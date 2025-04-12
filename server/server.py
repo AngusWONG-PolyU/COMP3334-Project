@@ -621,13 +621,12 @@ def edit_file():
         return jsonify({'error': 'Missing file_id'}), 400
 
     # Read new update values from the form.
-    # These fields are optional: user can update filename, encrypted AES key, and/or file content.
+    # These fields are optional: user can update filename, and/or file content.
     new_raw_filename = request.form.get('filename')
-    new_enc_aes_key = request.form.get('enc_aes_key')
     new_file = request.files.get('file')
 
     # At least one update must be provided.
-    if not new_raw_filename and not new_enc_aes_key and not new_file:
+    if not new_raw_filename and not new_file:
         return jsonify({'error': 'No update provided'}), 400
 
     # Sanitize the new filename if provided.
@@ -654,9 +653,6 @@ def edit_file():
     if new_filename:
         update_fields.append('filename = ?')
         params.append(new_filename)
-    if new_enc_aes_key:
-        update_fields.append('enc_aes_key = ?')
-        params.append(new_enc_aes_key)
     if new_file:
         # Read and update the file data.
         file_data = new_file.read()
