@@ -293,7 +293,7 @@ def login():
     cur.execute("SELECT * FROM users WHERE username = ?", (username,))
     user = cur.fetchone()
     if not user:
-        conn.close() # Close connection before returning
+        conn.close()  # Close connection before returning
         return jsonify({'error': 'Invalid username or password'}), 401
 
     # Check if account is currently locked.
@@ -306,11 +306,12 @@ def login():
         lockout_time_dt = datetime.strptime(lockout_time, "%Y-%m-%d %H:%M:%S")
         if current_time < lockout_time_dt:
             remaining = (lockout_time_dt - current_time).seconds
-            conn.close() # Close connection before returning
+            conn.close()  # Close connection before returning
             return jsonify({'error': f"Account locked. Try again after {remaining} seconds."}), 403
         else:
             # Lockout expired, reset it before proceeding
-            cur.execute("UPDATE users SET lockout_time = NULL WHERE username = ?", (username,))
+            cur.execute(
+                "UPDATE users SET lockout_time = NULL WHERE username = ?", (username,))
             conn.commit()
             # Keep connection open as we proceed to check credentials
 
@@ -323,20 +324,22 @@ def login():
         log_operation(username, "login fail",
                       f"User {username} logged in fail. From {request.remote_addr}")
         # Need to re-fetch failed_attempts as lockout might have been reset above
-        cur.execute("SELECT failed_attempts FROM users WHERE username = ?", (username,))
+        cur.execute(
+            "SELECT failed_attempts FROM users WHERE username = ?", (username,))
         current_failed_attempts = cur.fetchone()['failed_attempts']
         failed_attempts = current_failed_attempts if current_failed_attempts is not None else 0
         failed_attempts += 1
 
         # If maximum attempts reached, lock account for 30 seconds.
         if failed_attempts >= 3:
-            lockout_period = timedelta(seconds=30) # Use timedelta directly
+            lockout_period = timedelta(seconds=30)  # Use timedelta directly
             new_lockout_time = datetime.now() + lockout_period
-            new_lockout_time_str = new_lockout_time.strftime("%Y-%m-%d %H:%M:%S")
+            new_lockout_time_str = new_lockout_time.strftime(
+                "%Y-%m-%d %H:%M:%S")
             cur.execute("UPDATE users SET failed_attempts = 0, lockout_time = ? WHERE username = ?",
                         (new_lockout_time_str, username))
             conn.commit()
-            conn.close() # Close connection before returning
+            conn.close()  # Close connection before returning
             # *** This is the message that should now be returned correctly ***
             return jsonify({'error': "Too many failed login attempts. Account locked for 30 seconds."}), 403
         else:
@@ -344,7 +347,7 @@ def login():
             cur.execute("UPDATE users SET failed_attempts = ? WHERE username = ?",
                         (failed_attempts, username))
             conn.commit()
-            conn.close() # Close connection before returning
+            conn.close()  # Close connection before returning
             return jsonify({'error': "Invalid username or password or OTP."}), 401
 
     # Successful login: reset failed_attempts and lockout_time (if somehow set by expired lockout).
@@ -353,7 +356,7 @@ def login():
     conn.commit()
     # Do NOT close connection here yet, need it for cookie generation if that involved DB (it doesn't, but cleaner flow)
 
-    conn.close() # Close connection AFTER successful DB updates and before generating response
+    conn.close()  # Close connection AFTER successful DB updates and before generating response
 
     cookie = generate_session_cookie(username)
     response = make_response(jsonify({'message': 'Logged in successfully'}))
@@ -362,6 +365,7 @@ def login():
     log_operation(username, "login",
                   f"User {username} logged in. From {request.remote_addr}")
     return response
+
 
 @app.route('/reset_password', methods=['POST'])
 @require_login
@@ -693,6 +697,10 @@ def share_file():
 
     if not file_id or not target_username or not enc_aes_key:
         return jsonify({'error': 'Missing parameters'}), 400
+
+    # Check that the target username is not the same as the current user.
+    if target_username == request.username:
+        return jsonify({'error': 'You cannot share a file with yourself.'}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()

@@ -603,6 +603,23 @@ def share_file(session):
     file_id = input("Enter the ID of the file you want to share: ").strip()
     target_username = input("Enter the username to share with: ").strip()
 
+    # Client-side check: make sure the target is not the current user.
+    if target_username == SESSION_USERNAME:
+        print("Error: You cannot share a file with yourself.")
+        return
+
+    # Check if target user exists by reusing the /check_username endpoint.
+    try:
+        resp = session.get(
+            f"{SERVER_URL}/check_username?username={target_username}")
+        resp_json = resp.json()
+        if not resp_json.get("exists", False):
+            print(f"Error: User '{target_username}' does not exist.")
+            return
+    except Exception as e:
+        print("Error checking target user's existence:", e)
+        return
+
     # Step 1: Download the file to obtain the encrypted AES key.
     try:
         data = {"file_id": file_id}
